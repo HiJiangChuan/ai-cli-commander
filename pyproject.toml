@@ -1,0 +1,9 @@
+[project]
+name = "ai-commander"
+version = "0.1.0"
+description = "Thin MCP server bridging Claude to Gemini and Codex"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mcp>=1.27.0",
+]
