@@ -29,7 +29,13 @@ npm install -g @google/gemini-cli
 npm install -g @openai/codex
 ```
 
-安装后配置 OpenAI API Key：
+安装后运行以下命令登录（推荐，无需 API Key）：
+
+```bash
+codex login
+```
+
+也可以通过 API Key 使用：
 
 ```bash
 export OPENAI_API_KEY="your-api-key"
