@@ -7,6 +7,7 @@ Exposes two tools to Claude:
 """
 
 import asyncio
+import logging
 
 import mcp.types as types
 from mcp.server import Server
@@ -14,21 +15,31 @@ from mcp.server.stdio import stdio_server
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+# Suppress noisy codex/event validation warnings from MCP SDK
+logging.getLogger("root").setLevel(logging.ERROR)
+
 app = Server("ai-commander")
 
-CODEX_CMD = ["node", "/opt/homebrew/bin/codex", "mcp-server"]
-GEMINI_CMD = ["gemini"]
+GEMINI_TIMEOUT = 180  # seconds
+CODEX_TIMEOUT = 300   # codex is slower; give it 5 minutes
+CODEX_MODEL = "gpt-5.4"
 
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
 
 async def _call_gemini(prompt: str) -> str:
     proc = await asyncio.create_subprocess_exec(
-        *GEMINI_CMD, "-p", prompt,
+        "gemini", "-p", prompt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=GEMINI_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError(f"Gemini CLI timed out after {GEMINI_TIMEOUT}s")
+
     if proc.returncode != 0:
         err = stderr.decode().strip()
         raise RuntimeError(f"Gemini CLI error (exit {proc.returncode}): {err}")
@@ -38,11 +49,18 @@ async def _call_gemini(prompt: str) -> str:
 # ── Codex ─────────────────────────────────────────────────────────────────────
 
 async def _call_codex(prompt: str) -> str:
-    params = StdioServerParameters(command=CODEX_CMD[0], args=CODEX_CMD[1:])
+    params = StdioServerParameters(command="codex", args=["mcp-server"])
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool("codex", {"prompt": prompt})
+            try:
+                result = await asyncio.wait_for(
+                    session.call_tool("codex", {"prompt": prompt, "model": CODEX_MODEL}),
+                    timeout=CODEX_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"Codex timed out after {CODEX_TIMEOUT}s")
+
             parts = []
             for block in result.content:
                 if hasattr(block, "text"):
@@ -57,7 +75,7 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="ask_gemini",
-            description="Send a prompt to Gemini and return its response.",
+            description="Send a prompt to Gemini (gemini-2.5-pro) and return its response.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -68,7 +86,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="ask_codex",
-            description="Send a prompt to Codex (OpenAI) and return its response.",
+            description="Send a prompt to Codex (gpt-5.4) and return its response.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -86,12 +104,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if not prompt:
         raise ValueError("prompt is required")
 
-    if name == "ask_gemini":
-        text = await _call_gemini(prompt)
-    elif name == "ask_codex":
-        text = await _call_codex(prompt)
-    else:
-        raise ValueError(f"Unknown tool: {name}")
+    try:
+        if name == "ask_gemini":
+            text = await _call_gemini(prompt)
+        elif name == "ask_codex":
+            text = await _call_codex(prompt)
+        else:
+            raise ValueError(f"Unknown tool: {name}")
+    except Exception as e:
+        # Return error as text content instead of crashing the server
+        return [types.TextContent(type="text", text=f"[ERROR] {type(e).__name__}: {e}")]
 
     return [types.TextContent(type="text", text=text)]
 
