@@ -477,7 +477,7 @@ async def _call_codex(prompt: str, ctx: Optional[Context] = None) -> str:
         thread_result = await client.request("thread/start", {
             "cwd": os.getcwd(),
             "approvalPolicy": "never",
-            "sandbox": "workspaceWrite",
+            "sandbox": {"type": "workspaceWrite"},
         })
         thread_id = (thread_result or {}).get("thread", {}).get("id")
         if not thread_id:
