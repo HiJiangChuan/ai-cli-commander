@@ -7,7 +7,7 @@
 通过 MCP（Model Context Protocol）向 Claude 暴露两个工具：
 
 - **`ask_gemini`** — 将 prompt 发送给 Gemini CLI，返回结果
-- **`ask_codex`** — 连接 `codex mcp-server`，调用 Codex
+- **`ask_codex`** — 连接 `codex app-server`，调用 Codex
 
 这样你就能在 Claude Code 里做多 AI 协作：把任务分配给 Gemini 或 Codex，对比输出，或者各取所长。
 

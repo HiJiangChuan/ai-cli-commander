@@ -25,10 +25,24 @@ GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "180"))
 CODEX_TIMEOUT = int(os.getenv("CODEX_TIMEOUT", "300"))
 GEMINI_MAX_CONCURRENT = int(os.getenv("GEMINI_MAX_CONCURRENT", "4"))
 CODEX_MAX_CONCURRENT = int(os.getenv("CODEX_MAX_CONCURRENT", "4"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # 1 initial + 2 retries
+MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
 
-_gemini_sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
-_codex_sem = asyncio.Semaphore(CODEX_MAX_CONCURRENT)
+_gemini_sem: Optional[asyncio.Semaphore] = None
+_codex_sem: Optional[asyncio.Semaphore] = None
+
+
+def _get_gemini_sem() -> asyncio.Semaphore:
+    global _gemini_sem
+    if _gemini_sem is None:
+        _gemini_sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
+    return _gemini_sem
+
+
+def _get_codex_sem() -> asyncio.Semaphore:
+    global _codex_sem
+    if _codex_sem is None:
+        _codex_sem = asyncio.Semaphore(CODEX_MAX_CONCURRENT)
+    return _codex_sem
 
 
 # ── LineBuffer (from Roundtable cli/base.py) ─────────────────────────────────
@@ -228,6 +242,12 @@ class _ACPClient:
             pass
         except Exception:
             pass
+        finally:
+            for pending in self._pending.values():
+                if not pending.fut.done():
+                    pending.fut.set_exception(
+                        RuntimeError("Process exited unexpectedly")
+                    )
 
     async def _send(self, obj: Dict[str, Any]) -> None:
         if not self._proc or not self._proc.stdin:
@@ -288,6 +308,7 @@ async def _call_gemini(prompt: str) -> str:
 
         # Initialize
         await client.request("initialize", {
+            "clientInfo": {"name": "ai-commander", "version": "0.1.0"},
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
             "protocolVersion": 1,
         })
@@ -325,7 +346,6 @@ async def _call_gemini(prompt: str) -> str:
             except asyncio.TimeoutError:
                 raise RuntimeError(f"Gemini timed out after {GEMINI_TIMEOUT}s")
 
-            await asyncio.sleep(0.1)
             return "".join(text_chunks).strip() or "[No response from Gemini]"
         finally:
             client.off_notification("session/update", _on_update)
@@ -382,7 +402,7 @@ async def _call_codex(prompt: str) -> str:
         thread_result = await client.request("thread/start", {
             "cwd": os.getcwd(),
             "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
+            "sandbox": "workspaceWrite",
         })
         thread_id = (thread_result or {}).get("thread", {}).get("id")
         if not thread_id:
@@ -419,26 +439,26 @@ mcp = FastMCP("ai-commander")
 async def ask_gemini(prompt: str) -> str:
     """Send a prompt to Gemini (gemini-2.5-pro) and return its response."""
     errors: List[str] = []
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            async with _gemini_sem:
+            async with _get_gemini_sem():
                 return await _call_gemini(prompt)
         except Exception as exc:
-            errors.append(f"Attempt {attempt + 1}/{MAX_RETRIES}: {type(exc).__name__}: {exc}")
-    return "[ERROR] Gemini failed after {} attempts:\n{}".format(MAX_RETRIES, "\n".join(errors))
+            errors.append(f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: {type(exc).__name__}: {exc}")
+    return "[ERROR] Gemini failed after {} attempts:\n{}".format(MAX_ATTEMPTS, "\n".join(errors))
 
 
 @mcp.tool()
 async def ask_codex(prompt: str) -> str:
     """Send a prompt to Codex (gpt-5.4) and return its response."""
     errors: List[str] = []
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            async with _codex_sem:
+            async with _get_codex_sem():
                 return await _call_codex(prompt)
         except Exception as exc:
-            errors.append(f"Attempt {attempt + 1}/{MAX_RETRIES}: {type(exc).__name__}: {exc}")
-    return "[ERROR] Codex failed after {} attempts:\n{}".format(MAX_RETRIES, "\n".join(errors))
+            errors.append(f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: {type(exc).__name__}: {exc}")
+    return "[ERROR] Codex failed after {} attempts:\n{}".format(MAX_ATTEMPTS, "\n".join(errors))
 
 
 if __name__ == "__main__":
