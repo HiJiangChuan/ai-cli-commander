@@ -25,6 +25,7 @@ GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "180"))
 CODEX_TIMEOUT = int(os.getenv("CODEX_TIMEOUT", "300"))
 GEMINI_MAX_CONCURRENT = int(os.getenv("GEMINI_MAX_CONCURRENT", "4"))
 CODEX_MAX_CONCURRENT = int(os.getenv("CODEX_MAX_CONCURRENT", "4"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # 1 initial + 2 retries
 
 _gemini_sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
 _codex_sem = asyncio.Semaphore(CODEX_MAX_CONCURRENT)
@@ -417,21 +418,27 @@ mcp = FastMCP("ai-commander")
 @mcp.tool()
 async def ask_gemini(prompt: str) -> str:
     """Send a prompt to Gemini (gemini-2.5-pro) and return its response."""
-    try:
-        async with _gemini_sem:
-            return await _call_gemini(prompt)
-    except Exception as exc:
-        return f"[ERROR] {type(exc).__name__}: {exc}"
+    errors: List[str] = []
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with _gemini_sem:
+                return await _call_gemini(prompt)
+        except Exception as exc:
+            errors.append(f"Attempt {attempt + 1}/{MAX_RETRIES}: {type(exc).__name__}: {exc}")
+    return "[ERROR] Gemini failed after {} attempts:\n{}".format(MAX_RETRIES, "\n".join(errors))
 
 
 @mcp.tool()
 async def ask_codex(prompt: str) -> str:
     """Send a prompt to Codex (gpt-5.4) and return its response."""
-    try:
-        async with _codex_sem:
-            return await _call_codex(prompt)
-    except Exception as exc:
-        return f"[ERROR] {type(exc).__name__}: {exc}"
+    errors: List[str] = []
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with _codex_sem:
+                return await _call_codex(prompt)
+        except Exception as exc:
+            errors.append(f"Attempt {attempt + 1}/{MAX_RETRIES}: {type(exc).__name__}: {exc}")
+    return "[ERROR] Codex failed after {} attempts:\n{}".format(MAX_RETRIES, "\n".join(errors))
 
 
 if __name__ == "__main__":
