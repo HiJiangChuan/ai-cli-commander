@@ -5,27 +5,22 @@ Exposes two tools:
   - ask_gemini(prompt) → Gemini via ACP protocol (JSON-RPC over stdio)
   - ask_codex(prompt)  → Codex via app-server protocol (JSON-RPC over stdio)
 
-Both use the same ACPClient (JSON-RPC 2.0 over NDJSON/stdio).
-
-Design principles:
-  - Per-call subprocess isolation (no shared sessions, safe under concurrency)
-  - Semaphore-based concurrency control
-  - All exceptions caught and returned as [ERROR] text; server never crashes
-  - LineBuffer handles large NDJSON lines (bypasses asyncio 64KB limit)
+Architecture copied from Roundtable (claudable_helper/cli/adapters).
+Both providers use a shared _ACPClient (JSON-RPC 2.0 over NDJSON/stdio).
+Per-call subprocess isolation — each tool call spawns a fresh process.
 """
+from __future__ import annotations
 
 import asyncio
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-CODEX_MODEL = os.getenv("CODEX_MODEL", "gpt-5.4")
 GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "180"))
 CODEX_TIMEOUT = int(os.getenv("CODEX_TIMEOUT", "300"))
 GEMINI_MAX_CONCURRENT = int(os.getenv("GEMINI_MAX_CONCURRENT", "4"))
@@ -35,7 +30,7 @@ _gemini_sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
 _codex_sem = asyncio.Semaphore(CODEX_MAX_CONCURRENT)
 
 
-# ── LineBuffer ───────────────────────────────────────────────────────────────
+# ── LineBuffer (from Roundtable cli/base.py) ─────────────────────────────────
 
 class LineBuffer:
     """Async line reader that handles arbitrary line lengths.
@@ -45,48 +40,48 @@ class LineBuffer:
     """
 
     def __init__(self, stream: asyncio.StreamReader):
-        self._stream = stream
-        self._buf = b""
+        self.stream = stream
+        self.buffer = b""
 
     async def readline(self) -> bytes:
-        while b"\n" not in self._buf:
-            chunk = await self._stream.read(8192)
+        while b"\n" not in self.buffer:
+            chunk = await self.stream.read(8192)
             if not chunk:
-                line = self._buf
-                self._buf = b""
+                line = self.buffer
+                self.buffer = b""
                 return line
-            self._buf += chunk
-        line, self._buf = self._buf.split(b"\n", 1)
+            self.buffer += chunk
+        line, self.buffer = self.buffer.split(b"\n", 1)
         return line + b"\n"
 
 
-# ── ACP Client (JSON-RPC over stdio) ────────────────────────────────────────
+# ── _ACPClient (from Roundtable cli/adapters/qwen_cli.py) ───────────────────
 
 @dataclass
 class _Pending:
     fut: asyncio.Future
 
 
-class ACPClient:
+class _ACPClient:
     """Minimal JSON-RPC 2.0 client over newline-delimited JSON on stdio.
 
-    Used for Gemini ACP protocol. Handles:
+    Handles:
     - Outgoing requests with ID tracking and futures
     - Incoming responses routed to pending futures
     - Incoming notifications dispatched to handlers
     - Incoming server-side requests answered by registered handlers
     """
 
-    def __init__(self, cmd: list[str], env: dict[str, str] | None = None):
+    def __init__(self, cmd: List[str], env: Optional[Dict[str, str]] = None):
         self._cmd = cmd
         self._env = env or os.environ.copy()
-        self._proc: asyncio.subprocess.Process | None = None
+        self._proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 1
-        self._pending: dict[int, _Pending] = {}
-        self._notif_handlers: dict[str, list[Callable]] = {}
-        self._request_handlers: dict[str, Callable[[dict], Awaitable[dict]]] = {}
-        self._reader_task: asyncio.Task | None = None
-        self._stderr_task: asyncio.Task | None = None
+        self._pending: Dict[int, _Pending] = {}
+        self._notif_handlers: Dict[str, List[Callable]] = {}
+        self._request_handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]] = {}
+        self._reader_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         if self._proc is not None:
@@ -103,9 +98,9 @@ class ACPClient:
 
     async def stop(self) -> None:
         try:
-            for p in self._pending.values():
-                if not p.fut.done():
-                    p.fut.cancel()
+            for pending in self._pending.values():
+                if not pending.fut.done():
+                    pending.fut.cancel()
             self._pending.clear()
             if self._proc and self._proc.returncode is None:
                 self._proc.terminate()
@@ -116,21 +111,25 @@ class ACPClient:
                     await self._proc.wait()
         finally:
             self._proc = None
-            for task in (self._reader_task, self._stderr_task):
-                if task:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            self._reader_task = None
-            self._stderr_task = None
+            if self._reader_task:
+                self._reader_task.cancel()
+                try:
+                    await self._reader_task
+                except asyncio.CancelledError:
+                    pass
+                self._reader_task = None
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                try:
+                    await self._stderr_task
+                except asyncio.CancelledError:
+                    pass
+                self._stderr_task = None
 
     def on_notification(self, method: str, handler: Callable) -> None:
         self._notif_handlers.setdefault(method, []).append(handler)
 
-    def off_notification(self, method: str, handler: Callable | None = None) -> None:
-        """Remove notification handler(s). If handler is None, remove all."""
+    def off_notification(self, method: str, handler: Optional[Callable] = None) -> None:
         if method not in self._notif_handlers:
             return
         if handler is None:
@@ -140,10 +139,10 @@ class ACPClient:
                 h for h in self._notif_handlers[method] if h != handler
             ]
 
-    def on_request(self, method: str, handler: Callable[[dict], Awaitable[dict]]) -> None:
+    def on_request(self, method: str, handler: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]) -> None:
         self._request_handlers[method] = handler
 
-    async def request(self, method: str, params: dict | None = None) -> Any:
+    async def request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
         if not self._proc or not self._proc.stdin:
             raise RuntimeError("ACP process not started")
         msg_id = self._next_id
@@ -151,86 +150,116 @@ class ACPClient:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[msg_id] = _Pending(fut=fut)
         obj = {"jsonrpc": "2.0", "id": msg_id, "method": method, "params": params or {}}
-        self._proc.stdin.write((json.dumps(obj) + "\n").encode())
+        data = (json.dumps(obj) + "\n").encode("utf-8")
+        self._proc.stdin.write(data)
         await self._proc.stdin.drain()
         return await fut
 
-    async def _reader_loop(self) -> None:
-        assert self._proc and self._proc.stdout
-        reader = LineBuffer(self._proc.stdout)
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except Exception:
-                continue
+    async def send_notification(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Send a JSON-RPC notification (no id, no response expected)."""
+        if not self._proc or not self._proc.stdin:
+            raise RuntimeError("ACP process not started")
+        obj = {"jsonrpc": "2.0", "method": method}
+        if params:
+            obj["params"] = params
+        self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+        await self._proc.stdin.drain()
 
-            # Response to our request
-            if "id" in msg and "method" not in msg:
-                slot = self._pending.pop(msg["id"], None)
-                if slot:
+    async def _reader_loop(self) -> None:
+        try:
+            if not self._proc or not self._proc.stdout:
+                return
+            reader = LineBuffer(self._proc.stdout)
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+
+                if not isinstance(msg, dict):
+                    continue
+
+                # Response to our request
+                if "id" in msg and "method" not in msg:
+                    slot = self._pending.pop(int(msg["id"]), None) if isinstance(msg.get("id"), (int, str)) else None
+                    if not slot:
+                        continue
                     if "error" in msg:
                         slot.fut.set_exception(RuntimeError(str(msg["error"])))
                     else:
                         slot.fut.set_result(msg.get("result"))
-                continue
+                    continue
 
-            # Server-side request (needs response)
-            if "method" in msg and "id" in msg:
-                req_id = msg["id"]
-                handler = self._request_handlers.get(msg["method"])
-                if handler:
-                    try:
-                        result = await handler(msg.get("params") or {})
-                        await self._send({"jsonrpc": "2.0", "id": req_id, "result": result})
-                    except Exception as e:
+                # Request from agent (client-side)
+                if "method" in msg and "id" in msg:
+                    req_id = msg["id"]
+                    handler = self._request_handlers.get(msg["method"])
+                    if handler:
+                        try:
+                            result = await handler(msg.get("params") or {})
+                            await self._send({"jsonrpc": "2.0", "id": req_id, "result": result})
+                        except Exception as e:
+                            await self._send({
+                                "jsonrpc": "2.0", "id": req_id,
+                                "error": {"code": -32000, "message": str(e)},
+                            })
+                    else:
                         await self._send({
                             "jsonrpc": "2.0", "id": req_id,
-                            "error": {"code": -32000, "message": str(e)},
+                            "error": {"code": -32601, "message": "Method not found"},
                         })
-                else:
-                    await self._send({
-                        "jsonrpc": "2.0", "id": req_id,
-                        "error": {"code": -32601, "message": "Method not found"},
-                    })
-                continue
+                    continue
 
-            # Notification (no id)
-            if "method" in msg and "id" not in msg:
-                for h in self._notif_handlers.get(msg["method"], []):
-                    try:
-                        h(msg.get("params") or {})
-                    except Exception:
-                        pass
+                # Notification from agent
+                if "method" in msg and "id" not in msg:
+                    for h in self._notif_handlers.get(msg["method"], []):
+                        try:
+                            h(msg.get("params") or {})
+                        except Exception:
+                            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
-    async def _send(self, obj: dict) -> None:
-        if self._proc and self._proc.stdin:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode())
-            await self._proc.stdin.drain()
+    async def _send(self, obj: Dict[str, Any]) -> None:
+        if not self._proc or not self._proc.stdin:
+            return
+        self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
+        await self._proc.stdin.drain()
 
     async def _stderr_loop(self) -> None:
-        assert self._proc and self._proc.stderr
-        while True:
-            line = await self._proc.stderr.readline()
-            if not line:
-                break
+        """Background task to drain stderr to prevent blocking."""
+        try:
+            if not self._proc or not self._proc.stderr:
+                return
+            reader = LineBuffer(self._proc.stderr)
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
 
-# ── Gemini via ACP ───────────────────────────────────────────────────────────
+# ── Gemini via ACP (from Roundtable cli/adapters/gemini_cli.py) ──────────────
 
 async def _call_gemini(prompt: str) -> str:
     """Call Gemini CLI via ACP protocol. Per-call subprocess isolation."""
     env = os.environ.copy()
     env.setdefault("NO_BROWSER", "1")
-    client = ACPClient(["gemini", "--acp"], env=env)
+    client = _ACPClient(["gemini", "--acp"], env=env)
 
-    # Auto-approve permission requests
-    async def _handle_permission(params: dict) -> dict:
+    # Auto-approve permission requests (from Roundtable)
+    async def _handle_permission(params: Dict[str, Any]) -> Dict[str, Any]:
         options = params.get("options") or []
         chosen = None
         for kind in ("allow_always", "allow_once"):
@@ -243,12 +272,15 @@ async def _call_gemini(prompt: str) -> str:
             return {"outcome": {"outcome": "cancelled"}}
         return {"outcome": {"outcome": "selected", "optionId": chosen.get("optionId")}}
 
-    async def _fs_noop(params: dict) -> dict:
-        return {"content": ""} if "read" in str(params) else {}
+    async def _fs_read(params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"content": ""}
+
+    async def _fs_write(params: Dict[str, Any]) -> Dict[str, Any]:
+        return {}
 
     client.on_request("session/request_permission", _handle_permission)
-    client.on_request("fs/read_text_file", _fs_noop)
-    client.on_request("fs/write_text_file", _fs_noop)
+    client.on_request("fs/read_text_file", _fs_read)
+    client.on_request("fs/write_text_file", _fs_write)
 
     try:
         await client.start()
@@ -265,11 +297,10 @@ async def _call_gemini(prompt: str) -> str:
         if not session_id:
             raise RuntimeError("Failed to create Gemini session")
 
-        # Collect response text via notification handler
-        text_chunks: list[str] = []
-        q: asyncio.Queue = asyncio.Queue()
+        # Collect response text via notification handler (from Roundtable)
+        text_chunks: List[str] = []
 
-        def _on_update(params: dict) -> None:
+        def _on_update(params: Dict[str, Any]) -> None:
             if params.get("sessionId") != session_id:
                 return
             update = params.get("update") or {}
@@ -278,29 +309,25 @@ async def _call_gemini(prompt: str) -> str:
                 text = ((update.get("content") or {}).get("text")) or update.get("text") or ""
                 if isinstance(text, str) and text:
                     text_chunks.append(text)
-            q.put_nowait(update)
 
         client.on_notification("session/update", _on_update)
-
-        # Send prompt
-        prompt_task = asyncio.create_task(
-            client.request("session/prompt", {
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
-            })
-        )
-
-        # Wait for prompt completion with timeout
         try:
-            await asyncio.wait_for(prompt_task, timeout=GEMINI_TIMEOUT)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"Gemini timed out after {GEMINI_TIMEOUT}s")
+            # Send prompt and wait (from Roundtable)
+            try:
+                await asyncio.wait_for(
+                    client.request("session/prompt", {
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": prompt}],
+                    }),
+                    timeout=GEMINI_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"Gemini timed out after {GEMINI_TIMEOUT}s")
 
-        # Drain any remaining notifications
-        await asyncio.sleep(0.1)
-
-        return "".join(text_chunks).strip() or "[No response from Gemini]"
-
+            await asyncio.sleep(0.1)
+            return "".join(text_chunks).strip() or "[No response from Gemini]"
+        finally:
+            client.off_notification("session/update", _on_update)
     finally:
         await client.stop()
 
@@ -310,22 +337,21 @@ async def _call_gemini(prompt: str) -> str:
 async def _call_codex(prompt: str) -> str:
     """Call Codex CLI via app-server (JSON-RPC 2.0). Per-call subprocess isolation.
 
-    Uses the same ACPClient as Gemini — both speak JSON-RPC over stdio.
-    Protocol: initialize → thread/start → turn/start → item/* notifications → turn/completed
+    Protocol: initialize → initialized → thread/start → turn/start →
+              item/agentMessage/delta notifications → turn/completed
     """
-    client = ACPClient(["codex", "app-server"])
+    client = _ACPClient(["codex", "app-server"])
 
-    # Collect agent message deltas via notifications
-    text_chunks: list[str] = []
+    text_chunks: List[str] = []
     turn_done = asyncio.Event()
-    turn_error: list[str] = []
+    turn_error: List[str] = []
 
-    def _on_agent_delta(params: dict) -> None:
+    def _on_agent_delta(params: Dict[str, Any]) -> None:
         delta = params.get("delta", "")
         if isinstance(delta, str) and delta:
             text_chunks.append(delta)
 
-    def _on_turn_completed(params: dict) -> None:
+    def _on_turn_completed(params: Dict[str, Any]) -> None:
         turn = params.get("turn") or {}
         status = turn.get("status", "")
         if status == "failed":
@@ -349,10 +375,7 @@ async def _call_codex(prompt: str) -> str:
         })
 
         # 2. Send initialized notification (required by protocol)
-        if client._proc and client._proc.stdin:
-            notif = json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n"
-            client._proc.stdin.write(notif.encode())
-            await client._proc.stdin.drain()
+        await client.send_notification("initialized")
 
         # 3. Create thread with auto-approval
         thread_result = await client.request("thread/start", {
@@ -360,7 +383,7 @@ async def _call_codex(prompt: str) -> str:
             "approvalPolicy": "never",
             "sandbox": "danger-full-access",
         })
-        thread_id = thread_result.get("thread", {}).get("id")
+        thread_id = (thread_result or {}).get("thread", {}).get("id")
         if not thread_id:
             raise RuntimeError("Codex app-server: failed to create thread")
 
