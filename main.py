@@ -13,11 +13,28 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import shutil
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+
+LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", "~/.ai-commander/logs"))
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("ai-commander")
+logger.setLevel(logging.DEBUG)
+
+_file_handler = logging.FileHandler(os.path.join(LOG_DIR, "server.log"))
+_file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+))
+logger.addHandler(_file_handler)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -26,6 +43,8 @@ CODEX_TIMEOUT = int(os.getenv("CODEX_TIMEOUT", "300"))
 GEMINI_MAX_CONCURRENT = int(os.getenv("GEMINI_MAX_CONCURRENT", "4"))
 CODEX_MAX_CONCURRENT = int(os.getenv("CODEX_MAX_CONCURRENT", "4"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+READLINE_TIMEOUT = int(os.getenv("READLINE_TIMEOUT", "120"))
+MAX_CONSECUTIVE_TIMEOUTS = int(os.getenv("MAX_CONSECUTIVE_TIMEOUTS", "3"))
 
 _gemini_sem: Optional[asyncio.Semaphore] = None
 _codex_sem: Optional[asyncio.Semaphore] = None
@@ -43,6 +62,22 @@ def _get_codex_sem() -> asyncio.Semaphore:
     if _codex_sem is None:
         _codex_sem = asyncio.Semaphore(CODEX_MAX_CONCURRENT)
     return _codex_sem
+
+
+# ── CLI Availability Check ──────────────────────────────────────────────────
+
+def _check_cli_available(name: str) -> bool:
+    """Check if a CLI tool is installed and on PATH."""
+    return shutil.which(name) is not None
+
+
+def _ensure_cli(name: str) -> None:
+    """Raise immediately if the CLI is not installed."""
+    if not _check_cli_available(name):
+        raise RuntimeError(
+            f"'{name}' CLI not found on PATH. "
+            f"Install it first: see README.md for instructions."
+        )
 
 
 # ── LineBuffer (from Roundtable cli/base.py) ─────────────────────────────────
@@ -85,6 +120,7 @@ class _ACPClient:
     - Incoming responses routed to pending futures
     - Incoming notifications dispatched to handlers
     - Incoming server-side requests answered by registered handlers
+    - Per-readline timeout with consecutive timeout kill
     """
 
     def __init__(self, cmd: List[str], env: Optional[Dict[str, str]] = None):
@@ -120,7 +156,7 @@ class _ACPClient:
             if self._proc and self._proc.returncode is None:
                 self._proc.terminate()
                 try:
-                    await asyncio.wait_for(self._proc.wait(), timeout=2.0)
+                    await asyncio.wait_for(self._proc.wait(), timeout=10.0)
                 except asyncio.TimeoutError:
                     self._proc.kill()
                     await self._proc.wait()
@@ -181,20 +217,42 @@ class _ACPClient:
         await self._proc.stdin.drain()
 
     async def _reader_loop(self) -> None:
+        consecutive_timeouts = 0
         try:
             if not self._proc or not self._proc.stdout:
                 return
             reader = LineBuffer(self._proc.stdout)
             while True:
-                line = await reader.readline()
+                try:
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=READLINE_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    consecutive_timeouts += 1
+                    logger.warning(
+                        "[READER] readline timeout (%d/%d) for %s",
+                        consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS, self._cmd,
+                    )
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                        logger.error(
+                            "[READER] %d consecutive timeouts, killing process %s",
+                            MAX_CONSECUTIVE_TIMEOUTS, self._cmd,
+                        )
+                        if self._proc and self._proc.returncode is None:
+                            self._proc.kill()
+                        break
+                    continue
+
                 if not line:
                     break
+                consecutive_timeouts = 0
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     msg = json.loads(line.decode("utf-8"))
                 except Exception:
+                    logger.debug("[READER] non-JSON line from %s: %s", self._cmd[0], line[:200])
                     continue
 
                 if not isinstance(msg, dict):
@@ -240,8 +298,8 @@ class _ACPClient:
                             pass
         except asyncio.CancelledError:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("[READER] unexpected error in reader loop: %s", exc)
         finally:
             for pending in self._pending.values():
                 if not pending.fut.done():
@@ -256,7 +314,7 @@ class _ACPClient:
         await self._proc.stdin.drain()
 
     async def _stderr_loop(self) -> None:
-        """Background task to drain stderr to prevent blocking."""
+        """Background task to drain stderr and log it."""
         try:
             if not self._proc or not self._proc.stderr:
                 return
@@ -265,6 +323,9 @@ class _ACPClient:
                 line = await reader.readline()
                 if not line:
                     break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text:
+                    logger.debug("[STDERR:%s] %s", self._cmd[0], text)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -273,8 +334,9 @@ class _ACPClient:
 
 # ── Gemini via ACP (from Roundtable cli/adapters/gemini_cli.py) ──────────────
 
-async def _call_gemini(prompt: str) -> str:
+async def _call_gemini(prompt: str, ctx: Optional[Context] = None) -> str:
     """Call Gemini CLI via ACP protocol. Per-call subprocess isolation."""
+    _ensure_cli("gemini")
     env = os.environ.copy()
     env.setdefault("NO_BROWSER", "1")
     client = _ACPClient(["gemini", "--acp"], env=env)
@@ -305,6 +367,7 @@ async def _call_gemini(prompt: str) -> str:
 
     try:
         await client.start()
+        logger.info("[GEMINI] process started, initializing ACP")
 
         # Initialize
         await client.request("initialize", {
@@ -321,8 +384,10 @@ async def _call_gemini(prompt: str) -> str:
 
         # Collect response text via notification handler (from Roundtable)
         text_chunks: List[str] = []
+        chunk_count = 0
 
         def _on_update(params: Dict[str, Any]) -> None:
+            nonlocal chunk_count
             if params.get("sessionId") != session_id:
                 return
             update = params.get("update") or {}
@@ -331,9 +396,12 @@ async def _call_gemini(prompt: str) -> str:
                 text = ((update.get("content") or {}).get("text")) or update.get("text") or ""
                 if isinstance(text, str) and text:
                     text_chunks.append(text)
+                    chunk_count += 1
 
         client.on_notification("session/update", _on_update)
         try:
+            if ctx:
+                await ctx.report_progress(0, 1)
             # Send prompt and wait (from Roundtable)
             try:
                 await asyncio.wait_for(
@@ -346,6 +414,8 @@ async def _call_gemini(prompt: str) -> str:
             except asyncio.TimeoutError:
                 raise RuntimeError(f"Gemini timed out after {GEMINI_TIMEOUT}s")
 
+            if ctx:
+                await ctx.report_progress(1, 1)
             return "".join(text_chunks).strip() or "[No response from Gemini]"
         finally:
             client.off_notification("session/update", _on_update)
@@ -355,22 +425,26 @@ async def _call_gemini(prompt: str) -> str:
 
 # ── Codex via App-Server ─────────────────────────────────────────────────────
 
-async def _call_codex(prompt: str) -> str:
+async def _call_codex(prompt: str, ctx: Optional[Context] = None) -> str:
     """Call Codex CLI via app-server (JSON-RPC 2.0). Per-call subprocess isolation.
 
     Protocol: initialize → initialized → thread/start → turn/start →
               item/agentMessage/delta notifications → turn/completed
     """
+    _ensure_cli("codex")
     client = _ACPClient(["codex", "app-server"])
 
     text_chunks: List[str] = []
     turn_done = asyncio.Event()
     turn_error: List[str] = []
+    chunk_count = 0
 
     def _on_agent_delta(params: Dict[str, Any]) -> None:
+        nonlocal chunk_count
         delta = params.get("delta", "")
         if isinstance(delta, str) and delta:
             text_chunks.append(delta)
+            chunk_count += 1
 
     def _on_turn_completed(params: Dict[str, Any]) -> None:
         turn = params.get("turn") or {}
@@ -384,6 +458,7 @@ async def _call_codex(prompt: str) -> str:
 
     try:
         await client.start()
+        logger.info("[CODEX] process started, initializing app-server")
 
         # 1. Initialize handshake
         await client.request("initialize", {
@@ -410,6 +485,8 @@ async def _call_codex(prompt: str) -> str:
 
         # 4. Start turn with user prompt
         turn_done.clear()
+        if ctx:
+            await ctx.report_progress(0, 1)
         await client.request("turn/start", {
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt}],
@@ -424,6 +501,8 @@ async def _call_codex(prompt: str) -> str:
         if turn_error:
             raise RuntimeError(f"Codex error: {turn_error[0]}")
 
+        if ctx:
+            await ctx.report_progress(1, 1)
         return "".join(text_chunks).strip() or "[No response from Codex]"
 
     finally:
@@ -436,30 +515,41 @@ mcp = FastMCP("ai-commander")
 
 
 @mcp.tool()
-async def ask_gemini(prompt: str) -> str:
+async def ask_gemini(prompt: str, ctx: Context) -> str:
     """Send a prompt to Gemini (gemini-2.5-pro) and return its response."""
     errors: List[str] = []
     for attempt in range(MAX_ATTEMPTS):
+        t0 = time.monotonic()
         try:
             async with _get_gemini_sem():
-                return await _call_gemini(prompt)
+                result = await _call_gemini(prompt, ctx)
+            logger.info("[TOOL] ask_gemini OK in %.1fs", time.monotonic() - t0)
+            return result
         except Exception as exc:
+            elapsed = time.monotonic() - t0
             errors.append(f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: {type(exc).__name__}: {exc}")
+            logger.warning("[TOOL] ask_gemini attempt %d failed in %.1fs: %s", attempt + 1, elapsed, exc)
     return "[ERROR] Gemini failed after {} attempts:\n{}".format(MAX_ATTEMPTS, "\n".join(errors))
 
 
 @mcp.tool()
-async def ask_codex(prompt: str) -> str:
+async def ask_codex(prompt: str, ctx: Context) -> str:
     """Send a prompt to Codex (gpt-5.4) and return its response."""
     errors: List[str] = []
     for attempt in range(MAX_ATTEMPTS):
+        t0 = time.monotonic()
         try:
             async with _get_codex_sem():
-                return await _call_codex(prompt)
+                result = await _call_codex(prompt, ctx)
+            logger.info("[TOOL] ask_codex OK in %.1fs", time.monotonic() - t0)
+            return result
         except Exception as exc:
+            elapsed = time.monotonic() - t0
             errors.append(f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: {type(exc).__name__}: {exc}")
+            logger.warning("[TOOL] ask_codex attempt %d failed in %.1fs: %s", attempt + 1, elapsed, exc)
     return "[ERROR] Codex failed after {} attempts:\n{}".format(MAX_ATTEMPTS, "\n".join(errors))
 
 
 if __name__ == "__main__":
+    logger.info("ai-commander starting")
     mcp.run()
