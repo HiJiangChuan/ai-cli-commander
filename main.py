@@ -11,6 +11,8 @@ Design principles (informed by gemini-cli-mcp-server, PAL, multicli):
   - Per-call retry with exponential back-off for transient failures
   - All exceptions caught and returned as [ERROR] text; server never crashes
   - Timeouts configurable via environment variables
+  - Semaphore-based concurrency control to prevent resource exhaustion
+  - Single persistent Codex MCP session (codex mcp-server supports concurrent tool calls)
 """
 
 import asyncio
@@ -35,6 +37,12 @@ CODEX_MODEL    = os.getenv("CODEX_MODEL",    "gpt-5.4")
 GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "180"))
 CODEX_TIMEOUT  = int(os.getenv("CODEX_TIMEOUT",  "300"))
 MAX_RETRIES    = int(os.getenv("AI_MAX_RETRIES", "2"))
+GEMINI_MAX_CONCURRENT = int(os.getenv("GEMINI_MAX_CONCURRENT", "4"))
+CODEX_MAX_CONCURRENT  = int(os.getenv("CODEX_MAX_CONCURRENT",  "4"))
+
+# Concurrency limiters
+_gemini_sem = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
+_codex_sem  = asyncio.Semaphore(CODEX_MAX_CONCURRENT)
 
 # stderr lines that are non-fatal and should be silently dropped
 _GEMINI_STDERR_NOISE = (
@@ -99,29 +107,79 @@ async def _call_gemini_once(prompt: str) -> str:
 
 
 async def _call_gemini(prompt: str) -> str:
-    return await _with_retry(lambda: _call_gemini_once(prompt))
+    async with _gemini_sem:
+        return await _with_retry(lambda: _call_gemini_once(prompt))
+
+
+# ── Codex persistent session ────────────────────────────────────────────────
+
+class _CodexSession:
+    """
+    Single persistent Codex MCP session.
+
+    codex mcp-server (Rust/Tokio) supports concurrent tool calls within
+    one stdio connection, so a single session is sufficient. The lock only
+    guards lazy initialization; actual tool calls run concurrently.
+    """
+
+    def __init__(self):
+        self._session: ClientSession | None = None
+        self._client_ctx = None
+        self._session_ctx = None
+        self._lock = asyncio.Lock()
+
+    async def _connect(self):
+        params = StdioServerParameters(command="codex", args=["mcp-server"])
+        self._client_ctx = stdio_client(params)
+        read, write = await self._client_ctx.__aenter__()
+        self._session_ctx = ClientSession(read, write)
+        self._session = await self._session_ctx.__aenter__()
+        await self._session.initialize()
+
+    async def call(self, prompt: str) -> str:
+        async with self._lock:
+            if self._session is None:
+                await self._connect()
+        result = await asyncio.wait_for(
+            self._session.call_tool(
+                "codex",
+                {"prompt": prompt, "model": CODEX_MODEL},
+            ),
+            timeout=CODEX_TIMEOUT,
+        )
+        parts = [b.text for b in result.content if hasattr(b, "text")]
+        return "\n".join(parts).strip()
+
+    async def reset(self):
+        """Tear down a broken session; next call() will auto-reconnect."""
+        async with self._lock:
+            for ctx in (self._session_ctx, self._client_ctx):
+                if ctx:
+                    try:
+                        await ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+            self._session = None
+            self._client_ctx = None
+            self._session_ctx = None
+
+
+_codex = _CodexSession()
 
 
 # ── Codex ─────────────────────────────────────────────────────────────────────
 
 async def _call_codex_once(prompt: str) -> str:
-    params = StdioServerParameters(command="codex", args=["mcp-server"])
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await asyncio.wait_for(
-                session.call_tool(
-                    "codex",
-                    {"prompt": prompt, "model": CODEX_MODEL},
-                ),
-                timeout=CODEX_TIMEOUT,
-            )
-    parts = [block.text for block in result.content if hasattr(block, "text")]
-    return "\n".join(parts).strip()
+    try:
+        return await _codex.call(prompt)
+    except Exception:
+        await _codex.reset()
+        raise
 
 
 async def _call_codex(prompt: str) -> str:
-    return await _with_retry(lambda: _call_codex_once(prompt))
+    async with _codex_sem:
+        return await _with_retry(lambda: _call_codex_once(prompt))
 
 
 # ── MCP tool definitions ───────────────────────────────────────────────────────
