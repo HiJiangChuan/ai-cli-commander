@@ -3,10 +3,11 @@ ai-commander: thin MCP server bridging Claude to Gemini and Codex.
 
 Exposes two tools:
   - ask_gemini(prompt) → Gemini via ACP protocol (JSON-RPC over stdio)
-  - ask_codex(prompt)  → Codex via proto subcommand (NDJSON over stdio)
+  - ask_codex(prompt)  → Codex via app-server protocol (JSON-RPC over stdio)
+
+Both use the same ACPClient (JSON-RPC 2.0 over NDJSON/stdio).
 
 Design principles:
-  - Prompts passed via stdio, not command-line args (no ARG_MAX limit)
   - Per-call subprocess isolation (no shared sessions, safe under concurrency)
   - Semaphore-based concurrency control
   - All exceptions caught and returned as [ERROR] text; server never crashes
@@ -128,6 +129,17 @@ class ACPClient:
     def on_notification(self, method: str, handler: Callable) -> None:
         self._notif_handlers.setdefault(method, []).append(handler)
 
+    def off_notification(self, method: str, handler: Callable | None = None) -> None:
+        """Remove notification handler(s). If handler is None, remove all."""
+        if method not in self._notif_handlers:
+            return
+        if handler is None:
+            self._notif_handlers[method] = []
+        else:
+            self._notif_handlers[method] = [
+                h for h in self._notif_handlers[method] if h != handler
+            ]
+
     def on_request(self, method: str, handler: Callable[[dict], Awaitable[dict]]) -> None:
         self._request_handlers[method] = handler
 
@@ -215,7 +227,7 @@ async def _call_gemini(prompt: str) -> str:
     """Call Gemini CLI via ACP protocol. Per-call subprocess isolation."""
     env = os.environ.copy()
     env.setdefault("NO_BROWSER", "1")
-    client = ACPClient(["gemini", "--experimental-acp"], env=env)
+    client = ACPClient(["gemini", "--acp"], env=env)
 
     # Auto-approve permission requests
     async def _handle_permission(params: dict) -> dict:
@@ -293,136 +305,84 @@ async def _call_gemini(prompt: str) -> str:
         await client.stop()
 
 
-# ── Codex via Proto ──────────────────────────────────────────────────────────
+# ── Codex via App-Server ─────────────────────────────────────────────────────
 
 async def _call_codex(prompt: str) -> str:
-    """Call Codex CLI via proto subcommand. Per-call subprocess isolation."""
-    workdir = os.getcwd()
-    cmd = [
-        "codex", "--cd", workdir, "proto",
-        "-c", "include_apply_patch_tool=true",
-        "-c", "include_plan_tool=true",
-        "-c", "tools.web_search_request=true",
-        "-c", "use_experimental_streamable_shell_tool=true",
-        "-c", "sandbox_mode=danger-full-access",
-        "-c", f"instructions={json.dumps('Act autonomously. Use tools as needed. Keep responses concise.')}",
-    ]
+    """Call Codex CLI via app-server (JSON-RPC 2.0). Per-call subprocess isolation.
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=workdir,
-    )
+    Uses the same ACPClient as Gemini — both speak JSON-RPC over stdio.
+    Protocol: initialize → thread/start → turn/start → item/* notifications → turn/completed
+    """
+    client = ACPClient(["codex", "app-server"])
 
-    reader = LineBuffer(proc.stdout)
-    agent_message_buffer = ""
+    # Collect agent message deltas via notifications
+    text_chunks: list[str] = []
+    turn_done = asyncio.Event()
+    turn_error: list[str] = []
+
+    def _on_agent_delta(params: dict) -> None:
+        delta = params.get("delta", "")
+        if isinstance(delta, str) and delta:
+            text_chunks.append(delta)
+
+    def _on_turn_completed(params: dict) -> None:
+        status = params.get("status", "")
+        if status == "failed":
+            turn_error.append(params.get("error", "Turn failed"))
+        turn_done.set()
+
+    client.on_notification("item/agentMessage/delta", _on_agent_delta)
+    client.on_notification("turn/completed", _on_turn_completed)
 
     try:
-        # 1. Wait for session_configured
-        session_ready = False
-        for _ in range(100):
-            line = await asyncio.wait_for(reader.readline(), timeout=30)
-            if not line:
-                break
-            line_str = line.decode().strip()
-            if not line_str:
-                continue
-            try:
-                event = json.loads(line_str)
-                if event.get("msg", {}).get("type") == "session_configured":
-                    session_ready = True
-                    break
-            except json.JSONDecodeError:
-                continue
+        await client.start()
 
-        if not session_ready:
-            raise RuntimeError("Codex proto: failed to initialize session")
-
-        # 2. Set auto-approval policy
-        if proc.stdin:
-            payload = json.dumps({
-                "id": "ctl_approval",
-                "op": {
-                    "type": "override_turn_context",
-                    "approval_policy": "never",
-                    "sandbox_policy": {"mode": "danger-full-access"},
-                },
-            })
-            proc.stdin.write(payload.encode() + b"\n")
-            await proc.stdin.drain()
-
-        # 3. Send user input
-        request_id = f"msg_{os.urandom(4).hex()}"
-        user_input = json.dumps({
-            "id": request_id,
-            "op": {"type": "user_input", "items": [{"type": "text", "text": prompt}]},
+        # 1. Initialize handshake
+        await client.request("initialize", {
+            "clientInfo": {
+                "name": "ai_commander",
+                "title": "AI Commander MCP",
+                "version": "0.1.0",
+            },
+            "capabilities": {},
         })
-        proc.stdin.write(user_input.encode() + b"\n")
-        await proc.stdin.drain()
 
-        # 4. Read event stream until task_complete
-        while True:
-            try:
-                line = await asyncio.wait_for(reader.readline(), timeout=CODEX_TIMEOUT)
-            except asyncio.TimeoutError:
-                raise RuntimeError(f"Codex timed out after {CODEX_TIMEOUT}s")
+        # 2. Send initialized notification (required by protocol)
+        if client._proc and client._proc.stdin:
+            notif = json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n"
+            client._proc.stdin.write(notif.encode())
+            await client._proc.stdin.drain()
 
-            if not line:
-                break
+        # 3. Create thread with auto-approval
+        thread_result = await client.request("thread/start", {
+            "cwd": os.getcwd(),
+            "approvalPolicy": "never",
+            "sandbox": "full-access",
+        })
+        thread_id = thread_result.get("thread", {}).get("id")
+        if not thread_id:
+            raise RuntimeError("Codex app-server: failed to create thread")
 
-            line_str = line.decode().strip()
-            if not line_str:
-                continue
+        # 4. Start turn with user prompt
+        turn_done.clear()
+        await client.request("turn/start", {
+            "threadId": thread_id,
+            "input": prompt,
+        })
 
-            try:
-                event = json.loads(line_str)
-            except json.JSONDecodeError:
-                continue
+        # 5. Wait for turn/completed notification
+        try:
+            await asyncio.wait_for(turn_done.wait(), timeout=CODEX_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"Codex timed out after {CODEX_TIMEOUT}s")
 
-            msg = event.get("msg") or {}
-            msg_type = msg.get("type")
+        if turn_error:
+            raise RuntimeError(f"Codex error: {turn_error[0]}")
 
-            # Filter to current request
-            event_id = event.get("id", "")
-            if event_id and event_id != request_id and msg_type not in (
-                "session_configured", "mcp_list_tools_response"
-            ):
-                continue
-
-            if msg_type == "agent_message_delta":
-                agent_message_buffer += msg.get("delta", "")
-            elif msg_type == "agent_message":
-                if not agent_message_buffer:
-                    final_msg = msg.get("message")
-                    if isinstance(final_msg, str) and final_msg:
-                        agent_message_buffer = final_msg
-            elif msg_type == "task_complete":
-                break
-            elif msg_type == "error":
-                error_msg = msg.get("message", "Unknown error")
-                raise RuntimeError(f"Codex error: {error_msg}")
-
-        return agent_message_buffer.strip() or "[No response from Codex]"
+        return "".join(text_chunks).strip() or "[No response from Codex]"
 
     finally:
-        # Graceful shutdown
-        if proc.stdin:
-            try:
-                shutdown = json.dumps({"id": "shutdown", "op": {"type": "shutdown"}})
-                proc.stdin.write(shutdown.encode() + b"\n")
-                await proc.stdin.drain()
-                proc.stdin.close()
-            except Exception:
-                pass
-        if proc.returncode is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+        await client.stop()
 
 
 # ── FastMCP Server ───────────────────────────────────────────────────────────
