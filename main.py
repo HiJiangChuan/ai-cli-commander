@@ -326,9 +326,10 @@ async def _call_codex(prompt: str) -> str:
             text_chunks.append(delta)
 
     def _on_turn_completed(params: dict) -> None:
-        status = params.get("status", "")
+        turn = params.get("turn") or {}
+        status = turn.get("status", "")
         if status == "failed":
-            turn_error.append(params.get("error", "Turn failed"))
+            turn_error.append(turn.get("error", "Turn failed"))
         turn_done.set()
 
     client.on_notification("item/agentMessage/delta", _on_agent_delta)
@@ -357,7 +358,7 @@ async def _call_codex(prompt: str) -> str:
         thread_result = await client.request("thread/start", {
             "cwd": os.getcwd(),
             "approvalPolicy": "never",
-            "sandbox": "full-access",
+            "sandbox": "danger-full-access",
         })
         thread_id = thread_result.get("thread", {}).get("id")
         if not thread_id:
@@ -367,7 +368,7 @@ async def _call_codex(prompt: str) -> str:
         turn_done.clear()
         await client.request("turn/start", {
             "threadId": thread_id,
-            "input": prompt,
+            "input": [{"type": "text", "text": prompt}],
         })
 
         # 5. Wait for turn/completed notification
