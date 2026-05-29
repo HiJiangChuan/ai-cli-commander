@@ -1,95 +1,195 @@
 # ai-commander
 
-一个轻量 MCP server，让 Claude 可以在对话中直接调用 Gemini 和 Codex，把它们变成 Claude Code 里的工具。
+四个独立 MCP Server，让任意 AI Agent（OpenClaw、Hermes、Claude Code 等）可以统一调度 **Gemini、Codex、Kimi、Claude** 四个 AI。
 
-## 它做什么
+---
 
-通过 MCP（Model Context Protocol）向 Claude 暴露两个工具：
+## 架构设计
 
-- **`ask_gemini`** — 将 prompt 发送给 Gemini CLI，返回结果
-- **`ask_codex`** — 连接 `codex app-server`，调用 Codex
+### 为什么拆成四个独立 MCP Server？
 
-这样你就能在 Claude Code 里做多 AI 协作：把任务分配给 Gemini 或 Codex，对比输出，或者各取所长。
+| 原则 | 说明 |
+|------|------|
+| **独立生命周期** | 任一 Server 挂了不影响其他 AI |
+| **独立协议** | 四个 AI 的底层通信协议完全不同，必须独立实现 |
+| **按需挂载** | Agent 可以只装需要的，不必全装 |
+| **独立部署** | 未来可以单独拆出去发 PyPI 包 |
+
+### 整体架构
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Agent 主脑（任意模型：Kimi / Minimax / Claude / GPT / ...） │
+│  ── 负责推理、规划、决定调用哪个外部 AI                       │
+└────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│                    统一调度层：MCP 协议                      │
+│   ask_gemini() │ ask_codex() │ ask_kimi() │ ask_claude()   │
+└────────────────────────────────────────────────────────────┘
+            │           │           │           │
+            ▼           ▼           ▼           ▼
+      ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────────┐
+      │ Gemini  │ │  Codex  │ │  Kimi   │ │   Claude    │
+      │--acp CLI│ │app-svr  │ │ acp CLI │ │ -p --json   │
+      │ACP协议  │ │app-svr  │ │ ACP协议 │ │ CLI stdout  │
+      └─────────┘ └─────────┘ └─────────┘ └─────────────┘
+```
+
+### 四个 AI 的底层协议差异
+
+| AI | 启动命令 | 协议 | 核心流程 |
+|----|---------|------|---------|
+| **Gemini** | `gemini --acp` | ACP (JSON-RPC over stdio) | `initialize` → `session/new` → `session/prompt` → `session/update` 通知收集文本 |
+| **Kimi** | `kimi acp` | ACP (JSON-RPC over stdio) | `initialize` → `agent/request` → 流式响应通知收集文本 |
+| **Codex** | `codex app-server` | app-server (JSON-RPC over stdio) | `initialize` → `initialized` → `thread/start` → `turn/start` → `item/agentMessage/delta` → `turn/completed` |
+| **Claude** | `claude -p --output-format json --bare` | CLI stdout JSON | 直接解析子进程 stdout 的 `{result, cost_usd, duration_ms}` |
+
+> **注意**：Gemini 和 Kimi 虽然都叫 ACP，但方法名不同（Gemini 用 `session/prompt`，Kimi 用 `agent/request`），必须分别实现。
+
+---
 
 ## 前置条件
 
-在开始之前，需要先安装以下工具：
-
 **1. Gemini CLI**
-
 ```bash
 npm install -g @google/gemini-cli
+gemini auth login
 ```
-
-安装后运行 `gemini` 完成 Google 账号授权。
 
 **2. Codex CLI**
-
 ```bash
 npm install -g @openai/codex
-```
-
-安装后运行以下命令登录（推荐，无需 API Key）：
-
-```bash
 codex login
 ```
 
-也可以通过 API Key 使用：
-
+**3. Kimi CLI**
 ```bash
-export OPENAI_API_KEY="your-api-key"
+# macOS / Linux
+curl -fsSL https://code.kimi.com/install.sh | bash
+# 或
+uv tool install --python 3.13 kimi-cli
+
+kimi --version
+kimi /login
 ```
 
-**3. uv（Python 包管理器）**
+**4. Claude Code**
+```bash
+npm install -g @anthropic-ai/claude-code
+```
 
+**5. uv（Python 包管理器）**
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-**4. Python 3.14+** 和 **[Claude Code](https://claude.ai/code)**
+---
 
 ## 安装
-
-1. 克隆项目：
 
 ```bash
 git clone https://github.com/HiJiangChuan/ai-commander.git
 cd ai-commander
-```
-
-2. 安装依赖：
-
-```bash
 uv sync
 ```
 
-3. 在 `~/.claude/mcp.json` 中注册 MCP server：
+---
+
+## 注册 MCP Server
+
+在 `~/.claude/mcp.json` 中注册（将 `/path/to/ai-commander` 替换为实际路径）：
 
 ```json
 {
   "mcpServers": {
-    "ai-commander": {
+    "gemini": {
       "command": "uv",
-      "args": ["run", "python", "main.py"],
+      "args": ["run", "--package", "gemini-server", "python", "-m", "gemini_server"],
+      "cwd": "/path/to/ai-commander"
+    },
+    "codex": {
+      "command": "uv",
+      "args": ["run", "--package", "codex-server", "python", "-m", "codex_server"],
+      "cwd": "/path/to/ai-commander"
+    },
+    "kimi": {
+      "command": "uv",
+      "args": ["run", "--package", "kimi-server", "python", "-m", "kimi_server"],
+      "cwd": "/path/to/ai-commander"
+    },
+    "claude": {
+      "command": "uv",
+      "args": ["run", "--package", "claude-server", "python", "-m", "claude_server"],
       "cwd": "/path/to/ai-commander"
     }
   }
 }
 ```
 
-将 `/path/to/ai-commander` 替换为实际路径。
+OpenClaw 用户可在 Skills 中按同样方式挂载四个 MCP Server。
 
-4. 重启 Claude Code，`ask_gemini` 和 `ask_codex` 工具即可使用。
+---
 
 ## 使用
 
-在 Claude Code 会话中，Claude 可以调用：
+注册完成后，主 Agent 可以调用：
 
 ```
 ask_gemini("用一句话解释这个函数。")
 ask_codex("把这段代码重构成 async/await 风格。")
+ask_kimi("分析这个中文文档的核心观点。")
+ask_claude("审查这个方案的安全性。")
 ```
+
+---
+
+## 四 AI 能力分工建议
+
+| 工具 | 来源 | 最佳场景 |
+|------|------|---------|
+| `ask_gemini` | `gemini-server` | 长上下文（200万token）、Google搜索、创意写作 |
+| `ask_kimi` | `kimi-server` | 中文代码/文档、Kimi K2.5、国内网络优化 |
+| `ask_codex` | `codex-server` | GPT-5.4 代码生成、ChatGPT订阅免费额度 |
+| `ask_claude` | `claude-server` | Sonnet 4.6 复杂推理、多文件编辑、工具调用最强 |
+
+---
+
+## 项目结构
+
+```
+ai-commander/
+├── pyproject.toml                 # uv workspace
+├── README.md                      # 本文档
+├── mcp-config-example.json        # MCP 注册配置示例
+│
+├── gemini-server/                 # Gemini via gemini --acp
+│   ├── pyproject.toml
+│   └── src/gemini_server/
+│       ├── __init__.py
+│       └── server.py
+│
+├── codex-server/                  # Codex via codex app-server
+│   ├── pyproject.toml
+│   └── src/codex_server/
+│       ├── __init__.py
+│       └── server.py
+│
+├── kimi-server/                   # Kimi via kimi acp
+│   ├── pyproject.toml
+│   └── src/kimi_server/
+│       ├── __init__.py
+│       └── server.py
+│
+└── claude-server/                 # Claude via claude -p --output-format json
+    ├── pyproject.toml
+    └── src/claude_server/
+        ├── __init__.py
+        └── server.py
+```
+
+---
 
 ## License
 

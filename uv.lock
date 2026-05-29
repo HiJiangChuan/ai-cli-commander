@@ -2,16 +2,19 @@ version = 1
 revision = 3
 requires-python = ">=3.14"
 
-[[package]]
-name = "ai-bridge"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "mcp" },
+[manifest]
+members = [
+    "ai-commander",
+    "claude-server",
+    "codex-server",
+    "gemini-server",
+    "kimi-server",
 ]
 
-[package.metadata]
-requires-dist = [{ name = "mcp", specifier = ">=1.27.0" }]
+[[package]]
+name = "ai-commander"
+version = "0.2.0"
+source = { virtual = "." }
 
 [[package]]
 name = "annotated-types"
@@ -86,6 +89,17 @@ wheels = [
 ]
 
 [[package]]
+name = "claude-server"
+version = "0.1.0"
+source = { editable = "claude-server" }
+dependencies = [
+    { name = "mcp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mcp", specifier = ">=1.27.0" }]
+
+[[package]]
 name = "click"
 version = "8.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -96,6 +110,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/57/75/31212c6bf2503fdf9
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e4/20/71885d8b97d4f3dde17b1fdb92dbd4908b00541c5a3379787137285f602e/click-8.3.2-py3-none-any.whl", hash = "sha256:1924d2c27c5653561cd2cae4548d1406039cb79b858b747cfea24924bbc1616d", size = 108379, upload-time = "2026-04-03T19:14:43.505Z" },
 ]
+
+[[package]]
+name = "codex-server"
+version = "0.1.0"
+source = { editable = "codex-server" }
+dependencies = [
+    { name = "mcp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mcp", specifier = ">=1.27.0" }]
 
 [[package]]
 name = "colorama"
@@ -158,6 +183,17 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/4b/fa/f0ab06238e899cc3fb332623f337a7364f36f4bb3f2534c2bb95a35b132c/cryptography-46.0.7-cp38-abi3-win32.whl", hash = "sha256:f247c8c1a1fb45e12586afbb436ef21ff1e80670b2861a90353d9b025583d246", size = 3013001, upload-time = "2026-04-08T01:57:34.933Z" },
     { url = "https://files.pythonhosted.org/packages/d2/f1/00ce3bde3ca542d1acd8f8cfa38e446840945aa6363f9b74746394b14127/cryptography-46.0.7-cp38-abi3-win_amd64.whl", hash = "sha256:506c4ff91eff4f82bdac7633318a526b1d1309fc07ca76a3ad182cb5b686d6d3", size = 3472985, upload-time = "2026-04-08T01:57:36.714Z" },
 ]
+
+[[package]]
+name = "gemini-server"
+version = "0.1.0"
+source = { editable = "gemini-server" }
+dependencies = [
+    { name = "mcp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mcp", specifier = ">=1.27.0" }]
 
 [[package]]
 name = "h11"
@@ -240,6 +276,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/19/74/a633ee74eb36c44aa
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl", hash = "sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe", size = 18437, upload-time = "2025-09-08T01:34:57.871Z" },
 ]
+
+[[package]]
+name = "kimi-server"
+version = "0.1.0"
+source = { editable = "kimi-server" }
+dependencies = [
+    { name = "mcp" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mcp", specifier = ">=1.27.0" }]
 
 [[package]]
 name = "mcp"

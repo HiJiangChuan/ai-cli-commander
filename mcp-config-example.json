@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "gemini": {
+      "command": "uv",
+      "args": ["run", "--package", "gemini-server", "python", "-m", "gemini_server"],
+      "cwd": "/path/to/ai-commander"
+    },
+    "codex": {
+      "command": "uv",
+      "args": ["run", "--package", "codex-server", "python", "-m", "codex_server"],
+      "cwd": "/path/to/ai-commander"
+    },
+    "kimi": {
+      "command": "uv",
+      "args": ["run", "--package", "kimi-server", "python", "-m", "kimi_server"],
+      "cwd": "/path/to/ai-commander"
+    },
+    "claude": {
+      "command": "uv",
+      "args": ["run", "--package", "claude-server", "python", "-m", "claude_server"],
+      "cwd": "/path/to/ai-commander"
+    }
+  }
+}
