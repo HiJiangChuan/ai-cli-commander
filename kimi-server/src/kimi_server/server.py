@@ -12,7 +12,6 @@ import logging
 import os
 import shutil
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -274,85 +273,164 @@ class _ACPClient:
 # ── Kimi via ACP ─────────────────────────────────────────────────────────────
 
 async def _call_kimi(prompt: str, ctx: Optional[Context] = None) -> str:
-    """Call Kimi CLI via ACP protocol. Per-call subprocess isolation."""
+    """Call Kimi CLI via ACP protocol (standard ACP: session/new + session/prompt)."""
     _ensure_cli("kimi")
     client = _ACPClient(["kimi", "acp"])
 
-    # Collect streaming response text via notification handlers
-    text_chunks: List[str] = []
-    chunk_count = 0
-    response_done = asyncio.Event()
-    response_error: List[str] = []
+    # ── Client-side request handlers (Kimi CLI calls us) ────────────────
 
-    def _on_update(params: Dict[str, Any]) -> None:
-        nonlocal chunk_count
-        # Kimi ACP may stream content via various notification types;
-        # we collect from the most common ones.
-        content = params.get("content") or params.get("delta") or params.get("text") or ""
-        if isinstance(content, str) and content:
-            text_chunks.append(content)
-            chunk_count += 1
-        # Some ACP implementations signal completion via a 'done' field
-        if params.get("done") or params.get("finished"):
-            response_done.set()
+    async def _handle_permission(params: Dict[str, Any]) -> Dict[str, Any]:
+        options = params.get("options") or []
+        chosen = None
+        for kind in ("allow_always", "allow_once"):
+            chosen = next((o for o in options if o.get("kind") == kind), None)
+            if chosen:
+                break
+        if not chosen and options:
+            chosen = options[0]
+        if not chosen:
+            return {"outcome": {"outcome": "cancelled"}}
+        return {"outcome": {"outcome": "selected", "optionId": chosen.get("optionId")}}
 
-    def _on_error(params: Dict[str, Any]) -> None:
-        error_msg = params.get("message") or params.get("error") or "Unknown error"
-        response_error.append(str(error_msg))
-        response_done.set()
+    async def _fs_read(params: Dict[str, Any]) -> Dict[str, Any]:
+        path = params.get("path") or params.get("filePath") or ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return {"content": f.read()}
+        except Exception:
+            return {"content": ""}
 
-    client.on_notification("agent/update", _on_update)
-    client.on_notification("agent/delta", _on_update)
-    client.on_notification("agent/error", _on_error)
+    async def _fs_write(params: Dict[str, Any]) -> Dict[str, Any]:
+        path = params.get("path") or params.get("filePath") or ""
+        content = params.get("content") or ""
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+        return {}
+
+    _terminals: Dict[str, asyncio.subprocess.Process] = {}
+
+    async def _terminal_create(params: Dict[str, Any]) -> Dict[str, Any]:
+        cmd = params.get("command") or params.get("cmd") or "bash"
+        cwd = params.get("cwd") or os.getcwd()
+        terminal_id = str(len(_terminals) + 1)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            _terminals[terminal_id] = proc
+        except Exception as e:
+            logger.warning("[KIMI] terminal_create failed: %s", e)
+        return {"terminalId": terminal_id}
+
+    async def _terminal_output(params: Dict[str, Any]) -> Dict[str, Any]:
+        proc = _terminals.get(params.get("terminalId", ""))
+        if not proc or not proc.stdout:
+            return {"output": ""}
+        try:
+            data = await asyncio.wait_for(proc.stdout.read(65536), timeout=5.0)
+            return {"output": data.decode("utf-8", errors="replace")}
+        except asyncio.TimeoutError:
+            return {"output": ""}
+
+    async def _terminal_wait(params: Dict[str, Any]) -> Dict[str, Any]:
+        proc = _terminals.get(params.get("terminalId", ""))
+        if not proc:
+            return {"exitCode": -1}
+        try:
+            code = await asyncio.wait_for(proc.wait(), timeout=60.0)
+            return {"exitCode": code}
+        except asyncio.TimeoutError:
+            return {"exitCode": -1}
+
+    async def _terminal_kill(params: Dict[str, Any]) -> Dict[str, Any]:
+        proc = _terminals.pop(params.get("terminalId", ""), None)
+        if proc and proc.returncode is None:
+            proc.kill()
+        return {}
+
+    async def _terminal_release(params: Dict[str, Any]) -> Dict[str, Any]:
+        proc = _terminals.pop(params.get("terminalId", ""), None)
+        if proc and proc.returncode is None:
+            proc.kill()
+        return {}
+
+    client.on_request("session/request_permission", _handle_permission)
+    client.on_request("fs/read_text_file", _fs_read)
+    client.on_request("fs/write_text_file", _fs_write)
+    client.on_request("terminal/create", _terminal_create)
+    client.on_request("terminal/output", _terminal_output)
+    client.on_request("terminal/wait_for_exit", _terminal_wait)
+    client.on_request("terminal/kill", _terminal_kill)
+    client.on_request("terminal/release", _terminal_release)
 
     try:
         await client.start()
         logger.info("[KIMI] process started, initializing ACP")
 
-        # Initialize handshake
+        # Step 1: ACP initialize handshake
         await client.request("initialize", {
+            "protocolVersion": 1,
             "clientInfo": {"name": "kimi-server", "version": "0.1.0"},
-            "capabilities": {},
+            "clientCapabilities": {
+                "fs": {"readTextFile": True, "writeTextFile": True},
+                "terminal": True,
+            },
         })
 
-        if ctx:
-            await ctx.report_progress(0, 1)
+        # Step 2: Create session
+        result = await client.request("session/new", {"cwd": os.getcwd(), "mcpServers": []})
+        session_id = result.get("sessionId")
+        if not session_id:
+            raise RuntimeError("Failed to create Kimi session")
 
-        # Send prompt via agent/request
-        session_id = str(uuid.uuid4())
+        # Step 3: Collect streaming text via session/update notifications
+        text_chunks: List[str] = []
+        chunk_count = 0
+
+        def _on_update(params: Dict[str, Any]) -> None:
+            nonlocal chunk_count
+            if params.get("sessionId") != session_id:
+                return
+            update = params.get("update") or {}
+            kind = update.get("sessionUpdate") or update.get("type")
+            if kind in ("agent_message_chunk", "agent_thought_chunk"):
+                text = ((update.get("content") or {}).get("text")) or update.get("text") or ""
+                if isinstance(text, str) and text:
+                    text_chunks.append(text)
+                    chunk_count += 1
+
+        client.on_notification("session/update", _on_update)
         try:
-            result = await asyncio.wait_for(
-                client.request("agent/request", {
-                    "session_id": session_id,
-                    "work_dir": os.getcwd(),
-                    "prompt": prompt,
-                    "yolo": True,
-                }),
-                timeout=KIMI_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"Kimi timed out after {KIMI_TIMEOUT}s")
+            if ctx:
+                await ctx.report_progress(0, 1)
 
-        # If result comes back directly, use it; otherwise wait for notifications
-        if result and isinstance(result, dict):
-            direct_content = result.get("content") or ""
-            if direct_content:
-                return str(direct_content).strip()
-
-        # Fallback: if the response was streamed via notifications
-        if not response_done.is_set():
+            # Step 4: Send prompt
             try:
-                await asyncio.wait_for(response_done.wait(), timeout=10.0)
+                await asyncio.wait_for(
+                    client.request("session/prompt", {
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": prompt}],
+                    }),
+                    timeout=KIMI_TIMEOUT,
+                )
             except asyncio.TimeoutError:
-                pass  # notifications may not have a done signal
+                raise RuntimeError(f"Kimi timed out after {KIMI_TIMEOUT}s")
 
-        if response_error:
-            raise RuntimeError(f"Kimi error: {response_error[0]}")
-
-        if ctx:
-            await ctx.report_progress(1, 1)
-        return "".join(text_chunks).strip() or "[No response from Kimi]"
+            if ctx:
+                await ctx.report_progress(1, 1)
+            return "".join(text_chunks).strip() or "[No response from Kimi]"
+        finally:
+            client.off_notification("session/update", _on_update)
     finally:
+        for proc in _terminals.values():
+            if proc.returncode is None:
+                proc.kill()
+        _terminals.clear()
         await client.stop()
 
 

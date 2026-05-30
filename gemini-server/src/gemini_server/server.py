@@ -286,8 +286,11 @@ async def _call_gemini(prompt: str, ctx: Optional[Context] = None) -> str:
     """Call Gemini CLI via ACP protocol. Per-call subprocess isolation."""
     _ensure_cli("gemini")
     env = os.environ.copy()
-    env.setdefault("NO_BROWSER", "1")
-    client = _ACPClient(["gemini", "--acp"], env=env)
+    env.setdefault("GEMINI_CLI_NO_BROWSER", "true")
+    env.setdefault("GEMINI_CLI_NO_RELAUNCH", "true")
+    client = _ACPClient(["gemini", "--acp", "--approval-mode", "yolo", "--skip-trust"], env=env)
+
+    # ── Client-side request handlers (Gemini CLI calls us) ──────────────
 
     async def _handle_permission(params: Dict[str, Any]) -> Dict[str, Any]:
         options = params.get("options") or []
@@ -303,23 +306,100 @@ async def _call_gemini(prompt: str, ctx: Optional[Context] = None) -> str:
         return {"outcome": {"outcome": "selected", "optionId": chosen.get("optionId")}}
 
     async def _fs_read(params: Dict[str, Any]) -> Dict[str, Any]:
-        return {"content": ""}
+        path = params.get("path") or params.get("filePath") or ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return {"content": f.read()}
+        except Exception:
+            return {"content": ""}
 
     async def _fs_write(params: Dict[str, Any]) -> Dict[str, Any]:
+        path = params.get("path") or params.get("filePath") or ""
+        content = params.get("content") or ""
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+        return {}
+
+    # Terminal handlers — Gemini CLI sends terminal/* requests for shell cmds.
+    # We must respond or it hangs.
+    _terminals: Dict[str, asyncio.subprocess.Process] = {}
+
+    async def _terminal_create(params: Dict[str, Any]) -> Dict[str, Any]:
+        cmd = params.get("command") or params.get("cmd") or "bash"
+        cwd = params.get("cwd") or os.getcwd()
+        terminal_id = str(len(_terminals) + 1)
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            _terminals[terminal_id] = proc
+        except Exception as e:
+            logger.warning("[GEMINI] terminal_create failed: %s", e)
+            return {"terminalId": terminal_id}
+        return {"terminalId": terminal_id}
+
+    async def _terminal_output(params: Dict[str, Any]) -> Dict[str, Any]:
+        tid = params.get("terminalId") or ""
+        proc = _terminals.get(tid)
+        if not proc or not proc.stdout:
+            return {"output": ""}
+        try:
+            data = await asyncio.wait_for(proc.stdout.read(65536), timeout=5.0)
+            return {"output": data.decode("utf-8", errors="replace")}
+        except asyncio.TimeoutError:
+            return {"output": ""}
+
+    async def _terminal_wait(params: Dict[str, Any]) -> Dict[str, Any]:
+        tid = params.get("terminalId") or ""
+        proc = _terminals.get(tid)
+        if not proc:
+            return {"exitCode": -1}
+        try:
+            code = await asyncio.wait_for(proc.wait(), timeout=60.0)
+            return {"exitCode": code}
+        except asyncio.TimeoutError:
+            return {"exitCode": -1}
+
+    async def _terminal_kill(params: Dict[str, Any]) -> Dict[str, Any]:
+        tid = params.get("terminalId") or ""
+        proc = _terminals.pop(tid, None)
+        if proc and proc.returncode is None:
+            proc.kill()
+        return {}
+
+    async def _terminal_release(params: Dict[str, Any]) -> Dict[str, Any]:
+        tid = params.get("terminalId") or ""
+        proc = _terminals.pop(tid, None)
+        if proc and proc.returncode is None:
+            proc.kill()
         return {}
 
     client.on_request("session/request_permission", _handle_permission)
     client.on_request("fs/read_text_file", _fs_read)
     client.on_request("fs/write_text_file", _fs_write)
+    client.on_request("terminal/create", _terminal_create)
+    client.on_request("terminal/output", _terminal_output)
+    client.on_request("terminal/wait_for_exit", _terminal_wait)
+    client.on_request("terminal/kill", _terminal_kill)
+    client.on_request("terminal/release", _terminal_release)
 
     try:
         await client.start()
         logger.info("[GEMINI] process started, initializing ACP")
 
         await client.request("initialize", {
-            "clientInfo": {"name": "gemini-server", "version": "0.1.0"},
-            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
             "protocolVersion": 1,
+            "clientInfo": {"name": "gemini-server", "version": "0.1.0"},
+            "clientCapabilities": {
+                "fs": {"readTextFile": True, "writeTextFile": True},
+                "terminal": True,
+            },
         })
 
         result = await client.request("session/new", {"cwd": os.getcwd(), "mcpServers": []})
@@ -363,6 +443,11 @@ async def _call_gemini(prompt: str, ctx: Optional[Context] = None) -> str:
         finally:
             client.off_notification("session/update", _on_update)
     finally:
+        # Clean up any lingering terminal processes
+        for proc in _terminals.values():
+            if proc.returncode is None:
+                proc.kill()
+        _terminals.clear()
         await client.stop()
 
 

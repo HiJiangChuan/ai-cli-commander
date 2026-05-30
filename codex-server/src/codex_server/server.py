@@ -190,7 +190,9 @@ class _ACPClient:
                     line = await asyncio.wait_for(reader.readline(), timeout=READLINE_TIMEOUT)
                 except asyncio.TimeoutError:
                     consecutive_timeouts += 1
+                    logger.warning("[READER] readline timeout (%d/%d)", consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS)
                     if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                        logger.error("[READER] %d consecutive timeouts, killing process", MAX_CONSECUTIVE_TIMEOUTS)
                         if self._proc and self._proc.returncode is None:
                             self._proc.kill()
                         break
@@ -293,8 +295,16 @@ async def _call_codex(prompt: str, ctx: Optional[Context] = None) -> str:
             turn_error.append(turn.get("error", "Turn failed"))
         turn_done.set()
 
+    # Auto-approve any approval requests (safety net even with approvalPolicy "never")
+    async def _auto_approve(params: Dict[str, Any]) -> Dict[str, Any]:
+        logger.debug("[CODEX] auto-approving request: %s", params.get("command", params.get("path", "")))
+        return {"decision": "accept"}
+
     client.on_notification("item/agentMessage/delta", _on_agent_delta)
     client.on_notification("turn/completed", _on_turn_completed)
+    client.on_request("item/commandExecution/requestApproval", _auto_approve)
+    client.on_request("item/fileChange/requestApproval", _auto_approve)
+    client.on_request("item/permissions/requestApproval", _auto_approve)
 
     try:
         await client.start()
