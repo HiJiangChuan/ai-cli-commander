@@ -92,38 +92,45 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```bash
 git clone https://github.com/HiJiangChuan/ai-commander.git
 cd ai-commander
-uv sync
+
+# 将四个 MCP Server 安装为独立命令行工具
+uv tool install --from ./gemini-server gemini-server
+uv tool install --from ./codex-server codex-server
+uv tool install --from ./kimi-server kimi-server
+uv tool install --from ./claude-server claude-server
+```
+
+安装后，四个命令会出现在 `~/.local/bin/` 下，可直接执行，不依赖项目目录。
+
+更新时重新执行安装命令即可（加 `--force` 覆盖）：
+
+```bash
+cd ai-commander && git pull
+uv tool install --force --from ./gemini-server gemini-server
+uv tool install --force --from ./codex-server codex-server
+uv tool install --force --from ./kimi-server kimi-server
+uv tool install --force --from ./claude-server claude-server
+```
+
+卸载：
+
+```bash
+uv tool uninstall gemini-server codex-server kimi-server claude-server
 ```
 
 ---
 
 ## 注册 MCP Server
 
-在 `~/.claude/mcp.json` 中注册（将 `/path/to/ai-commander` 替换为实际路径）：
+在 `~/.claude/mcp.json` 中注册：
 
 ```json
 {
   "mcpServers": {
-    "gemini": {
-      "command": "uv",
-      "args": ["run", "--package", "gemini-server", "python", "-m", "gemini_server"],
-      "cwd": "/path/to/ai-commander"
-    },
-    "codex": {
-      "command": "uv",
-      "args": ["run", "--package", "codex-server", "python", "-m", "codex_server"],
-      "cwd": "/path/to/ai-commander"
-    },
-    "kimi": {
-      "command": "uv",
-      "args": ["run", "--package", "kimi-server", "python", "-m", "kimi_server"],
-      "cwd": "/path/to/ai-commander"
-    },
-    "claude": {
-      "command": "uv",
-      "args": ["run", "--package", "claude-server", "python", "-m", "claude_server"],
-      "cwd": "/path/to/ai-commander"
-    }
+    "gemini": { "command": "gemini-server" },
+    "codex": { "command": "codex-server" },
+    "kimi": { "command": "kimi-server" },
+    "claude": { "command": "claude-server" }
   }
 }
 ```
