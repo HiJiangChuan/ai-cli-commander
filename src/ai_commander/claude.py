@@ -1,7 +1,7 @@
 """
 claude-server: MCP server bridging agents to Claude Code CLI via headless mode.
 
-Protocol: CLI stdout JSON (claude -p --output-format json --bare).
+Protocol: CLI stdout JSON (claude -p --output-format json).
 Per-call subprocess isolation — each tool call spawns a fresh claude process.
 """
 from __future__ import annotations
@@ -45,7 +45,6 @@ async def _call_claude(
         prompt,
         "--output-format",
         "json",
-        "--bare",
         "--dangerously-skip-permissions",
         "--max-turns",
         str(max_turns),
@@ -57,13 +56,28 @@ async def _call_claude(
 
     logger.info("[CLAUDE] spawning: %s", " ".join(cmd))
 
+    # Ensure the child process inherits the full shell environment.
+    # This fixes "Not logged in" errors when the MCP server is launched
+    # from a GUI app (e.g. Claude Desktop) whose env differs from the
+    # interactive shell where `claude login` was performed.
+    env = os.environ.copy()
+    env.setdefault("HOME", os.path.expanduser("~"))
+    logger.debug(
+        "[CLAUDE] env: HOME=%s USER=%s PATH_PREFIX=%s...",
+        env.get("HOME"),
+        env.get("USER"),
+        env.get("PATH", "")[:80],
+    )
+
     if ctx:
         await ctx.report_progress(0, 1)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
 
     try:
@@ -82,6 +96,12 @@ async def _call_claude(
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
     if stderr_text:
         logger.debug("[CLAUDE STDERR] %s", stderr_text[:500])
+        if "not logged in" in stderr_text.lower():
+            raise RuntimeError(
+                "Claude reports 'Not logged in'. "
+                "Run `claude /login` in your terminal first, "
+                "and ensure the MCP server inherits the same environment (especially HOME)."
+            )
 
     stdout_text = stdout.decode("utf-8", errors="replace").strip()
     if not stdout_text:

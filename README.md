@@ -120,7 +120,7 @@ uv tool uninstall ai-commander
 
 ## 注册 MCP Server
 
-在 `~/.claude/mcp.json` 中注册：
+在 `/Users/username/.claude.json` 中注册：
 
 ```json
 {
