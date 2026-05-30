@@ -112,6 +112,10 @@ uv tool install --force --from ./kimi-server kimi-server
 uv tool install --force --from ./claude-server claude-server
 ```
 
+更新提示词（复制粘贴给任意 AI 即可）：
+
+> 帮我更新 ai-commander 的四个 MCP Server。步骤：进入 ~/Developer/ai-commander 目录，git pull 拉取最新代码，然后用 uv tool install --force 重新安装四个 server：gemini-server、codex-server、kimi-server、claude-server。每个的安装命令格式为 `uv tool install --force --from ./xxx-server xxx-server`。全部完成后告诉我结果。
+
 卸载：
 
 ```bash
