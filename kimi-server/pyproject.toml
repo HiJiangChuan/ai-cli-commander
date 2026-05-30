@@ -1,9 +1,0 @@
-[project]
-name = "kimi-server"
-version = "0.1.0"
-description = "MCP server for Kimi CLI via ACP protocol"
-requires-python = ">=3.14"
-dependencies = ["mcp>=1.27.0"]
-
-[project.scripts]
-kimi-server = "kimi_server.server:main"

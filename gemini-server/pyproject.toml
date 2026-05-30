@@ -1,9 +1,0 @@
-[project]
-name = "gemini-server"
-version = "0.1.0"
-description = "MCP server for Gemini CLI via ACP protocol"
-requires-python = ">=3.14"
-dependencies = ["mcp>=1.27.0"]
-
-[project.scripts]
-gemini-server = "gemini_server.server:main"

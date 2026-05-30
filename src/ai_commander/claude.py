@@ -10,25 +10,14 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import time
 from typing import List, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 
-# ── Logging ─────────────────────────────────────────────────────────────────
+from ai_commander.core import ensure_cli, get_semaphore, setup_logging
 
-LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", "~/.ai-commander/logs"))
-os.makedirs(LOG_DIR, exist_ok=True)
-
-logger = logging.getLogger("claude-server")
-logger.setLevel(logging.DEBUG)
-
-_file_handler = logging.FileHandler(os.path.join(LOG_DIR, "claude-server.log"))
-_file_handler.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-))
-logger.addHandler(_file_handler)
+logger = logging.getLogger("ai_commander.claude")
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -36,28 +25,9 @@ CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))
 CLAUDE_MAX_CONCURRENT = int(os.getenv("CLAUDE_MAX_CONCURRENT", "4"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
 
-_claude_sem: Optional[asyncio.Semaphore] = None
-
-
-def _get_claude_sem() -> asyncio.Semaphore:
-    global _claude_sem
-    if _claude_sem is None:
-        _claude_sem = asyncio.Semaphore(CLAUDE_MAX_CONCURRENT)
-    return _claude_sem
-
-
-# ── CLI Availability ────────────────────────────────────────────────────────
-
-def _check_cli_available(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-def _ensure_cli(name: str) -> None:
-    if not _check_cli_available(name):
-        raise RuntimeError(f"'{name}' CLI not found on PATH. Install it first.")
-
 
 # ── Claude via headless CLI ──────────────────────────────────────────────────
+
 
 async def _call_claude(
     prompt: str,
@@ -67,16 +37,20 @@ async def _call_claude(
     allowed_tools: str = "Read,Bash,Edit",
 ) -> str:
     """Call Claude Code CLI in headless mode. Per-call subprocess isolation."""
-    _ensure_cli("claude")
+    ensure_cli("claude")
 
     cmd = [
         "claude",
-        "-p", prompt,
-        "--output-format", "json",
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
         "--bare",
         "--dangerously-skip-permissions",
-        "--max-turns", str(max_turns),
-        "--max-budget-usd", str(max_budget_usd),
+        "--max-turns",
+        str(max_turns),
+        "--max-budget-usd",
+        str(max_budget_usd),
     ]
     if allowed_tools:
         cmd.extend(["--allowedTools", allowed_tools])
@@ -180,18 +154,30 @@ async def ask_claude(
     for attempt in range(MAX_ATTEMPTS):
         t0 = time.monotonic()
         try:
-            async with _get_claude_sem():
-                result = await _call_claude(prompt, ctx, max_turns, max_budget_usd, allowed_tools)
+            async with get_semaphore("claude", CLAUDE_MAX_CONCURRENT):
+                result = await _call_claude(
+                    prompt, ctx, max_turns, max_budget_usd, allowed_tools
+                )
             logger.info("[TOOL] ask_claude OK in %.1fs", time.monotonic() - t0)
             return result
         except Exception as exc:
             elapsed = time.monotonic() - t0
-            errors.append(f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: {type(exc).__name__}: {exc}")
-            logger.warning("[TOOL] ask_claude attempt %d failed in %.1fs: %s", attempt + 1, elapsed, exc)
-    return "[ERROR] Claude failed after {} attempts:\n{}".format(MAX_ATTEMPTS, "\n".join(errors))
+            errors.append(
+                f"Attempt {attempt + 1}/{MAX_ATTEMPTS}: {type(exc).__name__}: {exc}"
+            )
+            logger.warning(
+                "[TOOL] ask_claude attempt %d failed in %.1fs: %s",
+                attempt + 1,
+                elapsed,
+                exc,
+            )
+    return "[ERROR] Claude failed after {} attempts:\n{}".format(
+        MAX_ATTEMPTS, "\n".join(errors)
+    )
 
 
 def main():
+    setup_logging("ai_commander.claude")
     logger.info("claude-server starting")
     mcp.run()
 

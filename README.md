@@ -42,11 +42,11 @@
 | AI | 启动命令 | 协议 | 核心流程 |
 |----|---------|------|---------|
 | **Gemini** | `gemini --acp` | ACP (JSON-RPC over stdio) | `initialize` → `session/new` → `session/prompt` → `session/update` 通知收集文本 |
-| **Kimi** | `kimi acp` | ACP (JSON-RPC over stdio) | `initialize` → `agent/request` → 流式响应通知收集文本 |
+| **Kimi** | `kimi acp` | ACP (JSON-RPC over stdio) | `initialize` → `session/new` → `session/prompt` → `session/update` 通知收集文本 |
 | **Codex** | `codex app-server` | app-server (JSON-RPC over stdio) | `initialize` → `initialized` → `thread/start` → `turn/start` → `item/agentMessage/delta` → `turn/completed` |
 | **Claude** | `claude -p --output-format json --bare` | CLI stdout JSON | 直接解析子进程 stdout 的 `{result, cost_usd, duration_ms}` |
 
-> **注意**：Gemini 和 Kimi 虽然都叫 ACP，但方法名不同（Gemini 用 `session/prompt`，Kimi 用 `agent/request`），必须分别实现。
+> **注意**：Gemini 和 Kimi 虽然都叫 ACP，且方法名相同（均使用 `session/prompt`），但底层 CLI 命令、环境变量和 handler 注册仍有差异，因此仍需分别实现。
 
 ---
 
@@ -93,11 +93,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/HiJiangChuan/ai-commander.git
 cd ai-commander
 
-# 将四个 MCP Server 安装为独立命令行工具
-uv tool install --from ./gemini-server gemini-server
-uv tool install --from ./codex-server codex-server
-uv tool install --from ./kimi-server kimi-server
-uv tool install --from ./claude-server claude-server
+# 安装统一包（一次安装，获得四个命令）
+uv tool install .
 ```
 
 安装后，四个命令会出现在 `~/.local/bin/` 下，可直接执行，不依赖项目目录。
@@ -106,20 +103,17 @@ uv tool install --from ./claude-server claude-server
 
 ```bash
 cd ai-commander && git pull
-uv tool install --force --from ./gemini-server gemini-server
-uv tool install --force --from ./codex-server codex-server
-uv tool install --force --from ./kimi-server kimi-server
-uv tool install --force --from ./claude-server claude-server
+uv tool install --force .
 ```
 
 更新提示词（复制粘贴给任意 AI 即可）：
 
-> 帮我更新 ai-commander 的四个 MCP Server。步骤：进入 ~/Developer/ai-commander 目录，git pull 拉取最新代码，然后用 uv tool install --force 重新安装四个 server：gemini-server、codex-server、kimi-server、claude-server。每个的安装命令格式为 `uv tool install --force --from ./xxx-server xxx-server`。全部完成后告诉我结果。
+> 帮我更新 ai-commander。步骤：进入 ~/Developer/ai-commander 目录，git pull 拉取最新代码，然后执行 `uv tool install --force .` 重新安装。完成后告诉我结果。
 
 卸载：
 
 ```bash
-uv tool uninstall gemini-server codex-server kimi-server claude-server
+uv tool uninstall ai-commander
 ```
 
 ---
@@ -171,33 +165,17 @@ ask_claude("审查这个方案的安全性。")
 
 ```
 ai-commander/
-├── pyproject.toml                 # uv workspace
+├── pyproject.toml                 # 统一包配置
 ├── README.md                      # 本文档
 ├── mcp-config-example.json        # MCP 注册配置示例
 │
-├── gemini-server/                 # Gemini via gemini --acp
-│   ├── pyproject.toml
-│   └── src/gemini_server/
-│       ├── __init__.py
-│       └── server.py
-│
-├── codex-server/                  # Codex via codex app-server
-│   ├── pyproject.toml
-│   └── src/codex_server/
-│       ├── __init__.py
-│       └── server.py
-│
-├── kimi-server/                   # Kimi via kimi acp
-│   ├── pyproject.toml
-│   └── src/kimi_server/
-│       ├── __init__.py
-│       └── server.py
-│
-└── claude-server/                 # Claude via claude -p --output-format json
-    ├── pyproject.toml
-    └── src/claude_server/
-        ├── __init__.py
-        └── server.py
+└── src/ai_commander/              # 统一源码包
+    ├── __init__.py                # 包版本
+    ├── core.py                    # 公共代码：ACPClient、LineBuffer、日志、CLI 检查
+    ├── gemini.py                  # Gemini MCP Server
+    ├── codex.py                   # Codex MCP Server
+    ├── kimi.py                    # Kimi MCP Server
+    └── claude.py                  # Claude MCP Server
 ```
 
 ---
