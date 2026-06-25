@@ -24,6 +24,7 @@ async def _call_agy(prompt: str, ctx: Optional[Context] = None) -> str:
     ensure_cli("agy")
     proc = await asyncio.create_subprocess_exec(
         "agy", "--print", prompt, "--dangerously-skip-permissions",
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=os.environ.copy(),
