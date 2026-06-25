@@ -1,14 +1,13 @@
 [project]
 name = "ai-commander"
 version = "0.2.0"
-description = "Unified MCP servers bridging agents to Gemini, Codex, Kimi, and Claude"
+description = "Unified MCP servers bridging agents to Antigravity (agy), Codex, Kimi, and Claude"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.27.0"]
 
 [project.scripts]
 agy-server = "ai_commander.agy:main"
-gemini-server = "ai_commander.gemini:main"
 codex-server = "ai_commander.codex:main"
 kimi-server = "ai_commander.kimi:main"
 claude-server = "ai_commander.claude:main"

@@ -1,6 +1,6 @@
 # ai-commander
 
-四个独立 MCP Server，让任意 AI Agent（OpenClaw、Hermes、Claude Code 等）可以统一调度 **Gemini、Codex、Kimi、Claude** 四个 AI。
+四个独立 MCP Server，让任意 AI Agent（OpenClaw、Hermes、Claude Code 等）可以统一调度 **Antigravity (agy)、Codex、Kimi、Claude** 四个 AI。
 
 ---
 
@@ -26,14 +26,14 @@
                              ▼
 ┌────────────────────────────────────────────────────────────┐
 │                    统一调度层：MCP 协议                      │
-│   ask_gemini() │ ask_codex() │ ask_kimi() │ ask_claude()   │
+│   ask_agy()    │ ask_codex() │ ask_kimi() │ ask_claude()   │
 └────────────────────────────────────────────────────────────┘
             │           │           │           │
             ▼           ▼           ▼           ▼
       ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────────┐
-      │ Gemini  │ │  Codex  │ │  Kimi   │ │   Claude    │
-      │--acp CLI│ │app-svr  │ │ acp CLI │ │ -p --json   │
-      │ACP协议  │ │app-svr  │ │ ACP协议 │ │ CLI stdout  │
+      │   agy   │ │  Codex  │ │  Kimi   │ │   Claude    │
+      │--print  │ │app-svr  │ │ acp CLI │ │ -p --json   │
+      │ stdout  │ │app-svr  │ │ ACP协议 │ │ CLI stdout  │
       └─────────┘ └─────────┘ └─────────┘ └─────────────┘
 ```
 
@@ -41,21 +41,21 @@
 
 | AI | 启动命令 | 协议 | 核心流程 |
 |----|---------|------|---------|
-| **Gemini** | `gemini --acp` | ACP (JSON-RPC over stdio) | `initialize` → `session/new` → `session/prompt` → `session/update` 通知收集文本 |
+| **agy** | `agy --print` | CLI stdout | 直接读取子进程 stdout 输出 |
 | **Kimi** | `kimi acp` | ACP (JSON-RPC over stdio) | `initialize` → `session/new` → `session/prompt` → `session/update` 通知收集文本 |
 | **Codex** | `codex app-server` | app-server (JSON-RPC over stdio) | `initialize` → `initialized` → `thread/start` → `turn/start` → `item/agentMessage/delta` → `turn/completed` |
 | **Claude** | `claude -p --output-format json --bare` | CLI stdout JSON | 直接解析子进程 stdout 的 `{result, cost_usd, duration_ms}` |
 
-> **注意**：Gemini 和 Kimi 虽然都叫 ACP，且方法名相同（均使用 `session/prompt`），但底层 CLI 命令、环境变量和 handler 注册仍有差异，因此仍需分别实现。
+> **注意**：旧版 Gemini CLI（`gemini --acp`）自 2026年6月18日起对个人 Pro 用户停止服务，已由 Antigravity CLI (`agy`) 替代。
 
 ---
 
 ## 前置条件
 
-**1. Gemini CLI**
+**1. Antigravity CLI (agy)**
 ```bash
-npm install -g @google/gemini-cli
-gemini auth login
+# 首次运行时按提示通过浏览器完成 OAuth 授权
+agy
 ```
 
 **2. Codex CLI**
@@ -125,7 +125,7 @@ uv tool uninstall ai-commander
 ```json
 {
   "mcpServers": {
-    "gemini": { "command": "gemini-server" },
+    "ask_agy": { "command": "agy-server" },
     "codex": { "command": "codex-server" },
     "kimi": { "command": "kimi-server" },
     "claude": { "command": "claude-server" }
@@ -142,7 +142,7 @@ OpenClaw 用户可在 Skills 中按同样方式挂载四个 MCP Server。
 注册完成后，主 Agent 可以调用：
 
 ```
-ask_gemini("用一句话解释这个函数。")
+ask_agy("用一句话解释这个函数。")
 ask_codex("把这段代码重构成 async/await 风格。")
 ask_kimi("分析这个中文文档的核心观点。")
 ask_claude("审查这个方案的安全性。")
@@ -154,7 +154,7 @@ ask_claude("审查这个方案的安全性。")
 
 | 工具 | 来源 | 最佳场景 |
 |------|------|---------|
-| `ask_gemini` | `gemini-server` | 长上下文（200万token）、Google搜索、创意写作 |
+| `ask_agy` | `agy-server` | Gemini 3.5 Flash、Google 生态、长上下文 |
 | `ask_kimi` | `kimi-server` | 中文代码/文档、Kimi K2.5、国内网络优化 |
 | `ask_codex` | `codex-server` | GPT-5.4 代码生成、ChatGPT订阅免费额度 |
 | `ask_claude` | `claude-server` | Sonnet 4.6 复杂推理、多文件编辑、工具调用最强 |
@@ -172,7 +172,7 @@ ai-commander/
 └── src/ai_commander/              # 统一源码包
     ├── __init__.py                # 包版本
     ├── core.py                    # 公共代码：ACPClient、LineBuffer、日志、CLI 检查
-    ├── gemini.py                  # Gemini MCP Server
+    ├── agy.py                     # Antigravity MCP Server
     ├── codex.py                   # Codex MCP Server
     ├── kimi.py                    # Kimi MCP Server
     └── claude.py                  # Claude MCP Server
