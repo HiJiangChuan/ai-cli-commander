@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "gemini": { "command": "gemini-server" },
+    "ask_agy": { "command": "agy-server" },
     "codex": { "command": "codex-server" },
     "kimi": { "command": "kimi-server" },
     "claude": { "command": "claude-server" }
