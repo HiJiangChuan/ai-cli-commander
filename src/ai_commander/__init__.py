@@ -1,3 +1,3 @@
-"""ai-commander — unified MCP servers for Gemini, Codex, Kimi, and Claude."""
+"""ai-commander — MCP server bridging Claude to agy / Codex / Kimi / Claude via CLI."""
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"

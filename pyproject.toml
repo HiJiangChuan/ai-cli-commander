@@ -1,13 +1,25 @@
 [project]
-name = "ai-commander"
-version = "0.2.0"
-description = "Unified MCP servers bridging agents to Gemini, Codex, Kimi, and Claude"
+name = "ai-cli-commander"
+version = "1.0.0"
+description = "MCP server bridging Claude to Antigravity (agy), Codex, Kimi, and Claude via CLI"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.27.0"]
 
 [project.scripts]
-gemini-server = "ai_commander.gemini:main"
-codex-server = "ai_commander.codex:main"
-kimi-server = "ai_commander.kimi:main"
-claude-server = "ai_commander.claude:main"
+# 主入口
+ai-cli-commander-server = "ai_commander.server:main"
+
+# 向后兼容旧命令名
+ai-commander-server = "ai_commander.server:main"
+agy-server    = "ai_commander.server:main"
+codex-server  = "ai_commander.server:main"
+kimi-server   = "ai_commander.server:main"
+claude-server = "ai_commander.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
