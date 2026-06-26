@@ -1,5 +1,5 @@
 """
-ai-commander MCP server —— 统一入口，注册所有 AI 工具。
+ai-cli-commander MCP server —— 统一入口，注册所有 AI 工具。
 
 工具列表：
   ask_agy     → Antigravity CLI (Gemini Flash)
@@ -9,7 +9,13 @@ ai-commander MCP server —— 统一入口，注册所有 AI 工具。
   ask_all     → 并行调用多个 AI，汇总结果
   health      → 检查各 CLI 是否可用
 
-单次调用用 ask_xxx，并行评审用 ask_all。
+并发模型：
+  每个 Claude Code session 启动一个独立 server 进程，多个 session 之间互不干扰。
+  同一进程内（如 ask_all 并行调 3 个 AI），通过 per-agent semaphore 限制并发数：
+    AGY_MAX_CONCURRENT   默认 2（agy daemon 连接数有限）
+    CODEX_MAX_CONCURRENT 默认 3
+    KIMI_MAX_CONCURRENT  默认 2
+    CLAUDE_MAX_CONCURRENT 默认 2
 """
 from __future__ import annotations
 
@@ -18,7 +24,6 @@ import logging
 import os
 import sys
 import time
-from typing import Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -26,7 +31,7 @@ from ai_commander.agents import agy, claude, codex, kimi
 
 # ── 日志配置 ─────────────────────────────────────────────────────────────────
 
-LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", "~/.ai-commander/logs"))
+LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", "~/.ai-cli-commander/logs"))
 
 
 def _setup_logging() -> None:
@@ -35,7 +40,7 @@ def _setup_logging() -> None:
     if root.handlers:
         return
     root.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(os.path.join(LOG_DIR, "ai-commander.log"))
+    fh = logging.FileHandler(os.path.join(LOG_DIR, "ai-cli-commander.log"))
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -47,20 +52,36 @@ logger = logging.getLogger("ai_commander.server")
 
 # ── FastMCP 实例 ──────────────────────────────────────────────────────────────
 
-mcp = FastMCP("ai-commander")
+mcp = FastMCP("ai-cli-commander")
 
-# ── 工具包装器：统一错误处理 + 计时日志 ───────────────────────────────────────
+# ── 并发限流 ──────────────────────────────────────────────────────────────────
+# 每个 agent 独立的 semaphore，在 server 进程内全局共享。
+# ask_all 会并发触发多个 agent，这里确保不会无限叠加。
 
-async def _run(name: str, coro, ctx: Context) -> str:
+_sem: dict[str, asyncio.Semaphore] = {}
+
+
+def _get_sem(name: str, default: int) -> asyncio.Semaphore:
+    if name not in _sem:
+        limit = int(os.getenv(f"{name.upper()}_MAX_CONCURRENT", str(default)))
+        _sem[name] = asyncio.Semaphore(limit)
+    return _sem[name]
+
+
+# ── 工具包装器：semaphore + 错误处理 + 计时日志 ───────────────────────────────
+
+async def _run(name: str, coro, ctx: Context, max_concurrent: int = 3) -> str:
+    sem = _get_sem(name, max_concurrent)
     t0 = time.monotonic()
-    try:
-        result = await coro
-        logger.info("[%s] OK %.1fs", name, time.monotonic() - t0)
-        return result
-    except Exception as exc:
-        elapsed = time.monotonic() - t0
-        logger.error("[%s] FAIL %.1fs: %s", name, elapsed, exc)
-        return f"[{name} 失败] {exc}"
+    async with sem:
+        try:
+            result = await coro
+            logger.info("[%s] OK %.1fs", name, time.monotonic() - t0)
+            return result
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            logger.error("[%s] FAIL %.1fs: %s", name, elapsed, exc)
+            return f"[{name} 失败] {exc}"
 
 
 # ── ask_agy ──────────────────────────────────────────────────────────────────
@@ -68,7 +89,7 @@ async def _run(name: str, coro, ctx: Context) -> str:
 @mcp.tool()
 async def ask_agy(prompt: str, ctx: Context) -> str:
     """向 Antigravity CLI (agy / Gemini Flash) 发送提问，返回回复。"""
-    return await _run("agy", agy.call(prompt), ctx)
+    return await _run("agy", agy.call(prompt), ctx, max_concurrent=2)
 
 
 # ── ask_codex ─────────────────────────────────────────────────────────────────
@@ -85,7 +106,7 @@ async def ask_codex(
         prompt: 任务或问题。
         reasoning: 推理深度 —— low / medium / high / xhigh（默认 medium）。
     """
-    return await _run("codex", codex.call(prompt, reasoning=reasoning), ctx)
+    return await _run("codex", codex.call(prompt, reasoning=reasoning), ctx, max_concurrent=3)
 
 
 # ── ask_kimi ──────────────────────────────────────────────────────────────────
@@ -93,7 +114,7 @@ async def ask_codex(
 @mcp.tool()
 async def ask_kimi(prompt: str, ctx: Context) -> str:
     """向 Kimi CLI (K2.5) 发送提问，返回回复。"""
-    return await _run("kimi", kimi.call(prompt), ctx)
+    return await _run("kimi", kimi.call(prompt), ctx, max_concurrent=2)
 
 
 # ── ask_claude ────────────────────────────────────────────────────────────────
@@ -116,6 +137,7 @@ async def ask_claude(
         "claude",
         claude.call(prompt, max_turns=max_turns, allowed_tools=allowed_tools),
         ctx,
+        max_concurrent=2,
     )
 
 
@@ -214,7 +236,7 @@ async def health(ctx: Context) -> str:
 
 def main() -> None:
     _setup_logging()
-    logger.info("ai-commander-server 启动（Python %s）", sys.version.split()[0])
+    logger.info("ai-cli-commander-server 启动（Python %s）", sys.version.split()[0])
     mcp.run()
 
 

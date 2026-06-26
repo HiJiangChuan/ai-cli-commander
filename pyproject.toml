@@ -1,5 +1,5 @@
 [project]
-name = "ai-commander"
+name = "ai-cli-commander"
 version = "1.0.0"
 description = "MCP server bridging Claude to Antigravity (agy), Codex, Kimi, and Claude via CLI"
 readme = "README.md"
@@ -7,10 +7,11 @@ requires-python = ">=3.11"
 dependencies = ["mcp>=1.27.0"]
 
 [project.scripts]
-# 主入口：所有工具（ask_agy / ask_codex / ask_kimi / ask_claude / ask_all / health）
-ai-commander-server = "ai_commander.server:main"
+# 主入口
+ai-cli-commander-server = "ai_commander.server:main"
 
-# 向后兼容：旧配置指向这些命令的用户无需改动 .claude.json
+# 向后兼容旧命令名
+ai-commander-server = "ai_commander.server:main"
 agy-server    = "ai_commander.server:main"
 codex-server  = "ai_commander.server:main"
 kimi-server   = "ai_commander.server:main"
