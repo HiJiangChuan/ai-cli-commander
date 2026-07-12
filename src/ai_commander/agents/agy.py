@@ -1,11 +1,14 @@
 """
 agy agent —— 通过 `agy --print` 调用 Antigravity CLI。
 
-修复的核心问题：
+要点：
 1. stdin=DEVNULL：切断与 MCP 协议管道的连接
 2. start_new_session=True：独立进程组，防止 SIGHUP
 3. 注入终端环境变量：让 agy 认为自己在终端中运行
-4. 不重试超时（重试只会堆积更多僵尸 agy 进程）
+4. 不重试超时（重试只会堆积更多残留 agy 进程）
+
+注意：prompt 经 argv 传入（agy --print 的接口如此），在多用户系统上
+对 `ps` 可见，且受 ARG_MAX 限制；超长 prompt 请拆分。
 """
 from __future__ import annotations
 
@@ -24,14 +27,14 @@ TIMEOUT = float(os.getenv("AGY_TIMEOUT", "180"))
 MODEL = os.getenv("AGY_MODEL", "")  # 留空则使用 agy 默认模型
 
 
-async def call(prompt: str) -> str:
+async def call(prompt: str, *, cwd: str | None = None) -> str:
     require_cli(CLI)
 
     args = ["--print", prompt, "--dangerously-skip-permissions"]
     if MODEL:
         args = ["--model", MODEL] + args
 
-    result: SpawnResult = await spawn(CLI, args, timeout=TIMEOUT)
+    result: SpawnResult = await spawn(CLI, args, timeout=TIMEOUT, cwd=cwd)
 
     if result.timed_out:
         raise RuntimeError(
@@ -52,7 +55,7 @@ async def call(prompt: str) -> str:
 
 
 async def health_check() -> dict:
-    """快速检查 agy 是否可用（3秒超时）。"""
+    """检查 agy 是否可用（30 秒超时，会真实调用一次模型）。"""
     try:
         require_cli(CLI)
     except RuntimeError as e:
@@ -66,7 +69,7 @@ async def health_check() -> dict:
         "ok": result.ok,
         "latency_ms": result.duration_ms,
         "error": (
-            f"timeout after 30s" if result.timed_out
+            "timeout after 30s" if result.timed_out
             else (result.stderr.strip()[:200] if result.exit_code != 0 else None)
         ),
     }

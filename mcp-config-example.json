@@ -1,8 +1,5 @@
 {
   "mcpServers": {
-    "ask_agy": { "command": "agy-server" },
-    "codex": { "command": "codex-server" },
-    "kimi": { "command": "kimi-server" },
-    "claude": { "command": "claude-server" }
+    "ai-cli-commander": { "command": "ai-cli-commander-server" }
   }
 }

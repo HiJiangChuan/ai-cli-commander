@@ -6,16 +6,23 @@ kimi agent —— 通过 ACP 协议调用 Kimi CLI。
 
 Kimi CLI 特殊性：它会主动调用 fs/read_text_file、terminal/create 等请求，
 我们需要在客户端实现这些处理器，否则 Kimi 会卡住等待响应。
+
+终端模拟的设计：
+- 每个终端进程配一个后台排空任务，持续读 stdout 到缓冲区。
+  否则命令输出超过 PIPE 缓冲（约 64KB）时会卡住写入，wait_for_exit 永远等不到退出。
+- 终端 id 用自增计数器，不用 len()（释放后 len 会回退，导致 id 复用碰撞、进程泄漏）
+- stdin=DEVNULL：终端命令绝不继承 MCP 协议管道
 """
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 from typing import Any
 
 from ai_commander.acp import ACPClient
-from ai_commander.spawn import is_available, require_cli
+from ai_commander.spawn import is_available, kill_process_tree, require_cli
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +31,17 @@ DISPLAY_NAME = "Kimi"
 CLI = "kimi"
 
 TIMEOUT = float(os.getenv("KIMI_TIMEOUT", "300"))
+HANDSHAKE_TIMEOUT = float(os.getenv("KIMI_HANDSHAKE_TIMEOUT", "30"))
+_TERMINAL_WAIT_TIMEOUT = 120.0
+_TERMINAL_OUTPUT_CAP = 1024 * 1024  # 单个终端的输出缓冲上限
 
 
-async def call(prompt: str) -> str:
+async def call(prompt: str, *, cwd: str | None = None) -> str:
     require_cli(CLI)
+
+    working_dir = cwd or os.getcwd()
+    if not os.path.isdir(working_dir):
+        raise RuntimeError(f"工作目录不存在：{working_dir}")
 
     client = ACPClient([CLI, "acp"])
 
@@ -61,46 +75,82 @@ async def call(prompt: str) -> str:
             pass
         return {}
 
-    # 简单的终端模拟（Kimi 有时会要求执行命令）
-    _terminals: dict[str, asyncio.subprocess.Process] = {}
+    # ── 终端模拟（Kimi 有时会要求执行命令）─────────────────────────
+
+    _terminals: dict[str, dict[str, Any]] = {}
+    _terminal_ids = itertools.count(1)
+
+    async def _drain_output(proc: asyncio.subprocess.Process, buf: bytearray) -> None:
+        """持续排空终端 stdout，防止 PIPE 写满导致命令永远无法退出。"""
+        try:
+            assert proc.stdout
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                if len(buf) < _TERMINAL_OUTPUT_CAP:
+                    buf.extend(chunk)  # 超出上限后丢弃内容，但继续排空
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     async def _terminal_create(params: dict) -> dict:
-        cmd = params.get("command") or "bash"
-        cwd = params.get("cwd") or os.getcwd()
-        tid = str(len(_terminals) + 1)
-        proc = await asyncio.create_subprocess_shell(
-            cmd, cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-        _terminals[tid] = proc
+        command = params.get("command") or "bash"
+        arg_list = [str(a) for a in (params.get("args") or [])]
+        term_cwd = params.get("cwd") or working_dir
+        common: dict[str, Any] = {
+            "cwd": term_cwd,
+            "stdin": asyncio.subprocess.DEVNULL,  # 绝不继承 MCP 协议管道
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.STDOUT,
+            "start_new_session": True,
+        }
+        if arg_list:
+            proc = await asyncio.create_subprocess_exec(command, *arg_list, **common)
+        else:
+            proc = await asyncio.create_subprocess_shell(command, **common)
+        buf = bytearray()
+        tid = str(next(_terminal_ids))
+        _terminals[tid] = {
+            "proc": proc,
+            "buf": buf,
+            "drain": asyncio.create_task(_drain_output(proc, buf)),
+        }
         return {"terminalId": tid}
 
     async def _terminal_output(params: dict) -> dict:
-        proc = _terminals.get(params.get("terminalId", ""))
-        if not proc or not proc.stdout:
-            return {"output": ""}
-        try:
-            data = await asyncio.wait_for(proc.stdout.read(65536), timeout=5.0)
-            return {"output": data.decode("utf-8", errors="replace")}
-        except asyncio.TimeoutError:
-            return {"output": ""}
+        term = _terminals.get(params.get("terminalId", ""))
+        if not term:
+            return {"output": "", "truncated": False}
+        result: dict[str, Any] = {
+            "output": bytes(term["buf"]).decode("utf-8", errors="replace"),
+            "truncated": len(term["buf"]) >= _TERMINAL_OUTPUT_CAP,
+        }
+        proc = term["proc"]
+        if proc.returncode is not None:
+            result["exitStatus"] = {"exitCode": proc.returncode}
+        return result
 
     async def _terminal_wait(params: dict) -> dict:
-        proc = _terminals.get(params.get("terminalId", ""))
-        if not proc:
+        term = _terminals.get(params.get("terminalId", ""))
+        if not term:
             return {"exitCode": -1}
         try:
-            code = await asyncio.wait_for(proc.wait(), timeout=60.0)
+            code = await asyncio.wait_for(term["proc"].wait(), timeout=_TERMINAL_WAIT_TIMEOUT)
             return {"exitCode": code}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {"exitCode": -1}
 
+    def _release(term: dict[str, Any]) -> None:
+        term["drain"].cancel()
+        if term["proc"].returncode is None:
+            kill_process_tree(term["proc"])
+
     async def _terminal_release(params: dict) -> dict:
-        proc = _terminals.pop(params.get("terminalId", ""), None)
-        if proc and proc.returncode is None:
-            proc.kill()
+        term = _terminals.pop(params.get("terminalId", ""), None)
+        if term:
+            _release(term)
         return {}
 
     client.on_request("session/request_permission", _permission)
@@ -115,57 +165,64 @@ async def call(prompt: str) -> str:
     try:
         await client.start()
 
-        # 1. 握手
-        await client.request("initialize", {
-            "protocolVersion": 1,
-            "clientInfo": {"name": "ai-commander", "version": "1.0.0"},
-            "clientCapabilities": {
-                "fs": {"readTextFile": True, "writeTextFile": True},
-                "terminal": True,
-            },
-        })
+        # 1. 握手（必须限时：kimi 若在此阶段卡住，工具调用会永久挂起）
+        try:
+            await client.request("initialize", {
+                "protocolVersion": 1,
+                "clientInfo": {"name": "ai-cli-commander", "version": "1.1.0"},
+                "clientCapabilities": {
+                    "fs": {"readTextFile": True, "writeTextFile": True},
+                    "terminal": True,
+                },
+            }, timeout=HANDSHAKE_TIMEOUT)
 
-        # 2. 建立 session
-        result = await client.request("session/new", {
-            "cwd": os.getcwd(),
-            "mcpServers": [],
-        })
+            # 2. 建立 session
+            result = await client.request("session/new", {
+                "cwd": working_dir,
+                "mcpServers": [],
+            }, timeout=HANDSHAKE_TIMEOUT)
+        except TimeoutError:
+            raise RuntimeError(
+                f"Kimi 握手超时（{HANDSHAKE_TIMEOUT:.0f}s）。"
+                "请在终端运行 `kimi` 确认 CLI 可正常启动且已登录（`kimi /login`）。"
+            ) from None
+
         session_id = (result or {}).get("sessionId")
         if not session_id:
             raise RuntimeError("Kimi 未返回 sessionId")
 
-        # 3. 收集流式文本
-        chunks: list[str] = []
+        # 3. 收集流式文本。正文和思考分开收集：
+        #    正文优先；仅当正文为空时才回退到思考内容（部分场景 kimi 只发 thought）
+        message_chunks: list[str] = []
+        thought_chunks: list[str] = []
 
         def _on_update(params: dict[str, Any]) -> None:
             if params.get("sessionId") != session_id:
                 return
             update = params.get("update") or {}
             kind = update.get("sessionUpdate") or update.get("type")
-            if kind in ("agent_message_chunk", "agent_thought_chunk"):
-                text = (
-                    ((update.get("content") or {}).get("text"))
-                    or update.get("text")
-                    or ""
-                )
-                if isinstance(text, str) and text:
-                    chunks.append(text)
+            if kind not in ("agent_message_chunk", "agent_thought_chunk"):
+                return
+            text = (
+                ((update.get("content") or {}).get("text"))
+                or update.get("text")
+                or ""
+            )
+            if isinstance(text, str) and text:
+                (message_chunks if kind == "agent_message_chunk" else thought_chunks).append(text)
 
         client.on_notification("session/update", _on_update)
         try:
-            await asyncio.wait_for(
-                client.request("session/prompt", {
-                    "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": prompt}],
-                }),
-                timeout=TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"Kimi 超时（{TIMEOUT:.0f}s）")
+            await client.request("session/prompt", {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            }, timeout=TIMEOUT)
+        except TimeoutError:
+            raise RuntimeError(f"Kimi 超时（{TIMEOUT:.0f}s）") from None
         finally:
             client.off_notification("session/update", _on_update)
 
-        text = "".join(chunks).strip()
+        text = "".join(message_chunks).strip() or "".join(thought_chunks).strip()
         if not text:
             raise RuntimeError("Kimi 返回空响应")
 
@@ -173,9 +230,8 @@ async def call(prompt: str) -> str:
         return text
 
     finally:
-        for proc in _terminals.values():
-            if proc.returncode is None:
-                proc.kill()
+        for term in _terminals.values():
+            _release(term)
         _terminals.clear()
         await client.stop()
 
@@ -191,5 +247,5 @@ async def health_check() -> dict:
         "agent": NAME,
         "available": is_available(CLI),
         "ok": is_available(CLI),
-        "note": "kimi 健康检查仅验证 CLI 存在，完整测试需要调用 ask_kimi",
+        "note": "仅验证 CLI 存在，完整测试需调用 ask_kimi",
     }

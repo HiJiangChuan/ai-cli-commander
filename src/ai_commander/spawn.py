@@ -5,7 +5,8 @@ subprocess 工具 —— 所有 agent 的统一进程启动层。
 - stdin 默认 DEVNULL，彻底切断与 MCP 协议管道的连接
 - start_new_session=True：独立进程组，防止 SIGHUP 传播
 - 注入终端环境变量，避免 CLI 工具因检测不到 TTY 而挂起
-- 超时后强制 kill，不留僵尸进程
+- 超时后 kill 整个进程组（含 CLI 派生的孙进程），不留残留进程
+- 日志只记录命令名和参数个数，不记录参数内容（prompt 可能含敏感信息）
 """
 from __future__ import annotations
 
@@ -13,8 +14,8 @@ import asyncio
 import logging
 import os
 import shutil
+import signal
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -49,32 +50,54 @@ def require_cli(cmd: str) -> None:
         raise RuntimeError(f"'{cmd}' 未安装或不在 PATH 中，请先安装。")
 
 
+def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """杀死子进程及其整个进程组。
+
+    start_new_session=True 保证 pgid == pid，killpg 能覆盖 CLI 派生的孙进程；
+    进程组不存在时回退为只杀直接子进程。
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def spawn(
     cmd: str,
     args: list[str],
     *,
     timeout: float = 120.0,
-    stdin: Optional[str | bytes] = None,
-    env: Optional[dict[str, str]] = None,
-    cwd: Optional[str] = None,
+    stdin: str | bytes | None = None,
+    env: dict[str, str | None] | None = None,
+    cwd: str | None = None,
 ) -> SpawnResult:
     """
-    启动子进程，收集 stdout/stderr，超时后强制终止。
+    启动子进程，收集 stdout/stderr，超时后杀死整个进程组。
 
     stdin=None  → 子进程 stdin 接 DEVNULL（绝不继承 MCP socket）
-    stdin=<str> → 通过 pipe 传入，适合 codex exec / kimi acp
+    stdin=<str> → 通过 pipe 传入，适合 codex exec / claude -p
+    env 的值为 None 表示从环境中删除该变量（区别于设为空字符串）
     """
+    if cwd and not os.path.isdir(cwd):
+        raise RuntimeError(f"工作目录不存在：{cwd}")
+
     full_env = os.environ.copy()
     full_env.update(_TERMINAL_ENV)
-    if env:
-        full_env.update(env)
+    for key, value in (env or {}).items():
+        if value is None:
+            full_env.pop(key, None)
+        else:
+            full_env[key] = value
 
     stdin_mode = asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL
     stdin_bytes = stdin.encode() if isinstance(stdin, str) else stdin
 
-    t0 = asyncio.get_event_loop().time()
+    t0 = asyncio.get_running_loop().time()
 
-    logger.debug("spawn: %s %s", cmd, " ".join(args))
+    logger.debug("spawn: %s (%d args)", cmd, len(args))
 
     proc = await asyncio.create_subprocess_exec(
         cmd,
@@ -93,17 +116,21 @@ async def spawn(
             proc.communicate(stdin_bytes),
             timeout=timeout,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
+        kill_process_tree(proc)
         try:
-            proc.kill()
             await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except Exception:
+        except TimeoutError:
             pass
         stdout_bytes = b""
         stderr_bytes = b""
+    except asyncio.CancelledError:
+        # 调用方取消（如 MCP 客户端中断）时同样不能留下残留进程
+        kill_process_tree(proc)
+        raise
 
-    duration_ms = int((asyncio.get_event_loop().time() - t0) * 1000)
+    duration_ms = int((asyncio.get_running_loop().time() - t0) * 1000)
 
     result = SpawnResult(
         stdout=stdout_bytes.decode("utf-8", errors="replace"),

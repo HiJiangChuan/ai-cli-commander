@@ -2,20 +2,29 @@
 ai-cli-commander MCP server —— 统一入口，注册所有 AI 工具。
 
 工具列表：
-  ask_agy     → Antigravity CLI (Gemini Flash)
-  ask_codex   → Codex CLI (GPT-5.x)
+  ask_agy     → Antigravity CLI (Gemini)
+  ask_codex   → Codex CLI (GPT)
   ask_kimi    → Kimi CLI (K2.5)
-  ask_claude  → Claude Code CLI (Sonnet 4.x)
+  ask_claude  → Claude Code CLI
   ask_all     → 并行调用多个 AI，汇总结果
   health      → 检查各 CLI 是否可用
 
 并发模型：
-  每个 Claude Code session 启动一个独立 server 进程，多个 session 之间互不干扰。
-  同一进程内（如 ask_all 并行调 3 个 AI），通过 per-agent semaphore 限制并发数：
-    AGY_MAX_CONCURRENT   默认 2（agy daemon 连接数有限）
-    CODEX_MAX_CONCURRENT 默认 3
-    KIMI_MAX_CONCURRENT  默认 2
+  每个 MCP 客户端 session 启动一个独立 server 进程，多个 session 之间互不干扰。
+  同一进程内的所有调用（包括 ask_all 的并行分支）都经过 per-agent semaphore：
+    AGY_MAX_CONCURRENT    默认 2（agy daemon 连接数有限）
+    CODEX_MAX_CONCURRENT  默认 3
+    KIMI_MAX_CONCURRENT   默认 2
     CLAUDE_MAX_CONCURRENT 默认 2
+
+错误模型：
+  单个工具失败时抛出异常，由 FastMCP 标记为 isError 返回给客户端；
+  ask_all 中单个 AI 失败不影响其他 AI，失败信息汇总在结果文本里。
+
+日志：
+  写入 AI_COMMANDER_LOG_DIR（默认 ~/.ai-cli-commander/logs），自动轮转。
+  级别由 AI_COMMANDER_LOG_LEVEL 控制（默认 INFO）。
+  绝不写 stdout —— 那是 MCP 协议管道。
 """
 from __future__ import annotations
 
@@ -24,14 +33,18 @@ import logging
 import os
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
 
 from ai_commander.agents import agy, claude, codex, kimi
 
 # ── 日志配置 ─────────────────────────────────────────────────────────────────
 
-LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", "~/.ai-cli-commander/logs"))
+LOG_DIR = os.path.expanduser(
+    os.getenv("AI_COMMANDER_LOG_DIR") or os.getenv("LOG_DIR") or "~/.ai-cli-commander/logs"
+)
+LOG_LEVEL = os.getenv("AI_COMMANDER_LOG_LEVEL", "INFO").upper()
 
 
 def _setup_logging() -> None:
@@ -39,8 +52,12 @@ def _setup_logging() -> None:
     root = logging.getLogger("ai_commander")
     if root.handlers:
         return
-    root.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(os.path.join(LOG_DIR, "ai-cli-commander.log"))
+    root.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    fh = RotatingFileHandler(
+        os.path.join(LOG_DIR, "ai-cli-commander.log"),
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+    )
     fh.setFormatter(logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -54,24 +71,39 @@ logger = logging.getLogger("ai_commander.server")
 
 mcp = FastMCP("ai-cli-commander")
 
+# ── Agent 注册表 ──────────────────────────────────────────────────────────────
+# 每个模块须提供：call(prompt, *, cwd=None, ...)、health_check()、DISPLAY_NAME
+
+_AGENTS = {
+    "agy": agy,
+    "codex": codex,
+    "kimi": kimi,
+    "claude": claude,
+}
+
 # ── 并发限流 ──────────────────────────────────────────────────────────────────
 # 每个 agent 独立的 semaphore，在 server 进程内全局共享。
-# ask_all 会并发触发多个 agent，这里确保不会无限叠加。
+# 所有工具（含 ask_all 的并行分支）都必须经过 _run()，确保限流不被绕过。
+
+_DEFAULT_LIMITS = {"agy": 2, "codex": 3, "kimi": 2, "claude": 2}
 
 _sem: dict[str, asyncio.Semaphore] = {}
 
 
-def _get_sem(name: str, default: int) -> asyncio.Semaphore:
+def _get_sem(name: str) -> asyncio.Semaphore:
     if name not in _sem:
-        limit = int(os.getenv(f"{name.upper()}_MAX_CONCURRENT", str(default)))
-        _sem[name] = asyncio.Semaphore(limit)
+        default = _DEFAULT_LIMITS.get(name, 3)
+        try:
+            limit = int(os.getenv(f"{name.upper()}_MAX_CONCURRENT", "") or default)
+        except ValueError:
+            limit = default
+        _sem[name] = asyncio.Semaphore(max(1, limit))
     return _sem[name]
 
 
-# ── 工具包装器：semaphore + 错误处理 + 计时日志 ───────────────────────────────
-
-async def _run(name: str, coro, ctx: Context, max_concurrent: int = 3) -> str:
-    sem = _get_sem(name, max_concurrent)
+async def _run(name: str, coro) -> str:
+    """semaphore 限流 + 计时日志。失败时抛出异常，由调用方决定如何呈现。"""
+    sem = _get_sem(name)
     t0 = time.monotonic()
     async with sem:
         try:
@@ -79,116 +111,120 @@ async def _run(name: str, coro, ctx: Context, max_concurrent: int = 3) -> str:
             logger.info("[%s] OK %.1fs", name, time.monotonic() - t0)
             return result
         except Exception as exc:
-            elapsed = time.monotonic() - t0
-            logger.error("[%s] FAIL %.1fs: %s", name, elapsed, exc)
-            return f"[{name} 失败] {exc}"
+            logger.error("[%s] FAIL %.1fs: %s", name, time.monotonic() - t0, exc)
+            raise
 
 
-# ── ask_agy ──────────────────────────────────────────────────────────────────
+# ── 单 agent 工具 ─────────────────────────────────────────────────────────────
+
 
 @mcp.tool()
-async def ask_agy(prompt: str, ctx: Context) -> str:
-    """向 Antigravity CLI (agy / Gemini Flash) 发送提问，返回回复。"""
-    return await _run("agy", agy.call(prompt), ctx, max_concurrent=2)
+async def ask_agy(prompt: str, cwd: str = "") -> str:
+    """向 Antigravity CLI (agy / Gemini) 发送提问，返回回复。
 
+    Args:
+        prompt: 任务或问题。
+        cwd: 子进程工作目录（可选，默认继承 server 进程目录）。
+    """
+    return await _run("agy", agy.call(prompt, cwd=cwd or None))
 
-# ── ask_codex ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def ask_codex(
     prompt: str,
-    ctx: Context,
     reasoning: str = "medium",
+    model: str = "",
+    cwd: str = "",
 ) -> str:
-    """向 Codex CLI (GPT-5.x) 发送提问，返回回复。
+    """向 Codex CLI (GPT) 发送提问，返回回复。
 
     Args:
         prompt: 任务或问题。
-        reasoning: 推理深度 —— low / medium / high / xhigh（默认 medium）。
+        reasoning: 推理深度 —— minimal / low / medium / high / xhigh（默认 medium）。
+        model: 覆盖默认模型（可选）。
+        cwd: 子进程工作目录（可选，默认继承 server 进程目录）。
     """
-    return await _run("codex", codex.call(prompt, reasoning=reasoning), ctx, max_concurrent=3)
+    return await _run("codex", codex.call(prompt, reasoning=reasoning, model=model, cwd=cwd or None))
 
-
-# ── ask_kimi ──────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def ask_kimi(prompt: str, ctx: Context) -> str:
-    """向 Kimi CLI (K2.5) 发送提问，返回回复。"""
-    return await _run("kimi", kimi.call(prompt), ctx, max_concurrent=2)
+async def ask_kimi(prompt: str, cwd: str = "") -> str:
+    """向 Kimi CLI (K2.5) 发送提问，返回回复。
 
+    Args:
+        prompt: 任务或问题。
+        cwd: Kimi 会话工作目录（可选，默认继承 server 进程目录）。
+    """
+    return await _run("kimi", kimi.call(prompt, cwd=cwd or None))
 
-# ── ask_claude ────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def ask_claude(
     prompt: str,
-    ctx: Context,
     max_turns: int = 10,
     allowed_tools: str = "Read,Bash,Edit",
+    cwd: str = "",
 ) -> str:
-    """向 Claude Code CLI (Sonnet 4.x) 发送任务，返回回复。
+    """向 Claude Code CLI 发送任务，返回回复。
 
     Args:
         prompt: 任务或问题。
         max_turns: Agent 最大循环轮数（默认 10）。
-        allowed_tools: 允许的工具列表（逗号分隔，默认 Read,Bash,Edit）。
+        allowed_tools: 允许的工具白名单（逗号分隔，默认 Read,Bash,Edit）。
+            白名单外的工具在非交互模式下会被自动拒绝。
+        cwd: 子进程工作目录（可选，默认继承 server 进程目录）。
     """
     return await _run(
         "claude",
-        claude.call(prompt, max_turns=max_turns, allowed_tools=allowed_tools),
-        ctx,
-        max_concurrent=2,
+        claude.call(prompt, max_turns=max_turns, allowed_tools=allowed_tools, cwd=cwd or None),
     )
 
 
 # ── ask_all ───────────────────────────────────────────────────────────────────
 
-_AGENT_MAP = {
-    "agy": agy.call,
-    "codex": lambda p: codex.call(p),
-    "kimi": kimi.call,
-    "claude": lambda p: claude.call(p),
-}
 
-_AGENT_DISPLAY = {
-    "agy": agy.DISPLAY_NAME,
-    "codex": codex.DISPLAY_NAME,
-    "kimi": kimi.DISPLAY_NAME,
-    "claude": claude.DISPLAY_NAME,
-}
+def _parse_agents(agents: str) -> list[str]:
+    """解析逗号分隔的 agent 名单：去空白、小写、去重、过滤未知名称。"""
+    selected: list[str] = []
+    for raw in agents.split(","):
+        name = raw.strip().lower()
+        if name in _AGENTS and name not in selected:
+            selected.append(name)
+    return selected
 
 
 @mcp.tool()
 async def ask_all(
     prompt: str,
-    ctx: Context,
     agents: str = "agy,codex,kimi",
+    cwd: str = "",
 ) -> str:
     """并行向多个 AI 发送相同提问，汇总所有回复。
 
     Args:
         prompt: 发给所有 AI 的相同问题或任务。
         agents: 逗号分隔的 AI 列表（可选：agy, codex, kimi, claude），默认 agy,codex,kimi。
+        cwd: 子进程工作目录（可选，默认继承 server 进程目录）。
 
     适用场景：
-      - 3 个 AI 隔离评审同一段代码 / 文章
+      - 多个 AI 隔离评审同一段代码 / 文章
       - 对比不同 AI 的答案
       - 汇总后由主 AI 综合分析
     """
-    selected = [a.strip() for a in agents.split(",") if a.strip() in _AGENT_MAP]
+    selected = _parse_agents(agents)
     if not selected:
         return "[ask_all] 没有有效的 agent 名称。可选：agy, codex, kimi, claude"
 
     t0 = time.monotonic()
-    tasks = {name: asyncio.create_task(_AGENT_MAP[name](prompt)) for name in selected}
-
-    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    results = await asyncio.gather(
+        *(_run(name, _AGENTS[name].call(prompt, cwd=cwd or None)) for name in selected),
+        return_exceptions=True,
+    )
 
     lines = [f"# ask_all 并行结果（{len(selected)} 个 AI）\n"]
-    for name, result in zip(tasks.keys(), results):
-        display = _AGENT_DISPLAY.get(name, name)
-        lines.append(f"## {display}")
-        if isinstance(result, Exception):
+    for name, result in zip(selected, results, strict=True):
+        lines.append(f"## {_AGENTS[name].DISPLAY_NAME}")
+        if isinstance(result, BaseException):
             lines.append(f"❌ 失败：{result}\n")
         else:
             lines.append(f"{result}\n")
@@ -202,37 +238,37 @@ async def ask_all(
 
 # ── health ────────────────────────────────────────────────────────────────────
 
+
 @mcp.tool()
-async def health(ctx: Context) -> str:
+async def health() -> str:
     """检查所有 AI CLI 是否已安装并可用。"""
+    modules = list(_AGENTS.values())
     checks = await asyncio.gather(
-        agy.health_check(),
-        codex.health_check(),
-        kimi.health_check(),
-        claude.health_check(),
+        *(m.health_check() for m in modules),
         return_exceptions=True,
     )
 
-    lines = ["# AI Commander 健康检查\n"]
-    for check in checks:
-        if isinstance(check, Exception):
-            lines.append(f"- ❓ 检查失败：{check}")
+    lines = ["# ai-cli-commander 健康检查\n"]
+    for module, check in zip(modules, checks, strict=True):
+        display = module.DISPLAY_NAME
+        if isinstance(check, BaseException):
+            lines.append(f"- ❓ {display}：检查失败 —— {check}")
             continue
-        name = check.get("agent", "?")
-        display = _AGENT_DISPLAY.get(name, name)
         if not check.get("available"):
             lines.append(f"- ❌ {display}：CLI 未安装 —— {check.get('error', '')}")
         elif check.get("ok") is False:
             lines.append(f"- ⚠️  {display}：已安装但响应异常 —— {check.get('error', '')}")
         else:
-            ms = check.get("latency_ms", "")
-            ms_str = f"（{ms}ms）" if ms else ""
-            lines.append(f"- ✅ {display}：正常{ms_str}")
+            ms = check.get("latency_ms")
+            note = check.get("note")
+            suffix = f"（{ms}ms）" if ms else (f"（{note}）" if note else "")
+            lines.append(f"- ✅ {display}：正常{suffix}")
 
     return "\n".join(lines)
 
 
 # ── 入口 ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     _setup_logging()
